@@ -1,0 +1,247 @@
+name: M14 A16 One UI 8.5 experimental port
+run-name: "A16 8.5 → M14: ${{ inputs.mode }}"
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight: only source patch verification; build: experimental ROM candidate"
+        required: true
+        type: choice
+        default: preflight
+        options:
+          - preflight
+          - build
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream ReCoreUI 8.5 (MIT)
+        run: |
+          git clone --depth 1 --branch 8.5 https://github.com/KrrishJaat/ReCoreUI.git /tmp/ReCoreUI
+          git -C /tmp/ReCoreUI rev-parse HEAD | tee upstream-commit.txt
+
+      - name: Apply A16 donor / M14 stock patches (self-contained)
+        run: |
+          python3 - <<'PY_PORT'
+          #!/usr/bin/env python3
+          """Apply a minimal, reviewable A16 One UI 8.5 donor conversion to ReCoreUI 8.5.
+          
+          This prepares an experimental build. It does NOT validate boot, AVB or IMS.
+          Upstream project: https://github.com/KrrishJaat/ReCoreUI (MIT license).
+          """
+          from pathlib import Path
+          import argparse
+          import re
+          import sys
+          
+          DONOR = "A166BXXSADZH1/A166BOXMADZH1/A166BXXSADZH1/A166BXXSADZH1"
+          STOCK = "M146BXXSFDZI1/M146BOJMFDZI1/M146BXXSFDZI1/M146BXXSFDZI1"
+          
+          # Use the M14's UNMODIFIED, model-matched boot chain rather than the
+          # potentially root-enabled prebuilt boot images supplied by the port framework.
+          KERNEL_SCRIPT = r'''#!/usr/bin/env bash
+          # Experimental: take boot chain exclusively from the M14's stock AP package.
+          # NOTE: stock vbmeta may reject the modified system. Do not flash until
+          # AVB, kernel/system compatibility and rollback/recovery are audited.
+          # This script is sourced by the ReCoreUI builder: do not change shell options.
+          AP_DIR="${FW_BASE}/${STOCK_MODEL}_${STOCK_CSC}"
+          AP="$(find "$AP_DIR" -maxdepth 1 -type f \( -name 'AP_*.tar.md5' -o -name 'AP_*.tar' \) -print -quit)"
+          [[ -n "${AP:-}" && -s "$AP" ]] || { echo "Stock M14 AP archive missing"; return 1; }
+          
+          mkdir -p "$DIROUT"
+          for PART in boot vendor_boot dtbo vbmeta; do
+            ENTRY="$(tar -tf "$AP" | grep -E "(^|/)${PART}\.img\.lz4$" | head -n 1 || true)"
+            [[ -n "$ENTRY" ]] || { echo "Missing ${PART}.img.lz4 in stock AP"; return 1; }
+            TMP="$DIROUT/${PART}.img.tmp"
+            rm -f "$TMP"
+            if ! tar -xOf "$AP" "$ENTRY" | lz4 -dc > "$TMP"; then
+              echo "Decompression failed: ${PART}.img"
+              return 1
+            fi
+            [[ -s "$TMP" ]] || { echo "Empty ${PART}.img"; return 1; }
+            mv -f "$TMP" "$DIROUT/${PART}.img"
+          done
+          printf '%s\n' "Stock M14 boot components staged; AVB not validated."
+          '''
+          
+          def replace_assignment(s: str, key: str, value: str, required=True) -> str:
+              pattern = rf'(?m)^[ \t]*{re.escape(key)}="[^"\n]*"[ \t]*(?:#.*)?$'
+              replacement = f'{key}="{value}"'
+              if re.search(pattern, s):
+                  return re.sub(pattern, lambda _: replacement, s, count=1)
+              if required:
+                  raise ValueError(f"Upstream structure changed: {key} missing")
+              return s.rstrip() + "\n" + replacement + "\n"
+          
+          def apply(repo: Path):
+              required = [
+                  "build.sh", "objectives/m14x/m14x.sh",
+                  "scripts/utils/download_utils.sh", "scripts/unpack_fw.sh",
+                  "platform/m14x/kernel.sh",
+              ]
+              missing = [p for p in required if not (repo / p).is_file()]
+              if missing:
+                  raise FileNotFoundError("ReCoreUI 8.5 tree missing: " + ", ".join(missing))
+          
+              config = repo / "objectives/m14x/m14x.sh"
+              s = config.read_text()
+              for key, value in (
+                  ("MODEL", "SM-A166B"), ("CSC", "TUR"),
+                  ("PORT_FIRMWARE", DONOR),
+                  ("STOCK_MODEL", "SM-M146B"), ("STOCK_CSC", "TUR"),
+                  ("EXTRA_MODEL", ""), ("EXTRA_CSC", ""), ("EXTRA_FIRMWARE", ""),
+                  ("FILESYSTEM", "erofs"),
+              ):
+                  s = replace_assignment(s, key, value)
+              s = replace_assignment(s, "STOCK_FIRMWARE", STOCK, required=False)
+              config.write_text(s)
+          
+              downloader = repo / "scripts/utils/download_utils.sh"
+              s = downloader.read_text()
+              needle = '    elif [[ "${FW_PREFIX,,}" == "extra" ]]; then\n        REQUESTED_VERSION="$EXTRA_VERSION"'
+              if "REQUESTED_VERSION=\"${STOCK_FIRMWARE:-}\"" not in s:
+                  if needle not in s:
+                      raise ValueError("download_utils.sh: unexpected FETCH_FW structure")
+                  s = s.replace(needle, needle + '\n    elif [[ "${FW_PREFIX,,}" == "stock" ]]; then\n        REQUESTED_VERSION="${STOCK_FIRMWARE:-}"', 1)
+              downloader.write_text(s)
+          
+              unpacker = repo / "scripts/unpack_fw.sh"
+              s = unpacker.read_text()
+              old = 'if IS_GITHUB_ACTIONS; then rm -f "$AP_PACKAGE" && rm -rf "$SOURCE_DIR"; fi'
+              new = 'if IS_GITHUB_ACTIONS && [[ "$FW_TYPE" != "stock" ]]; then rm -f "$AP_PACKAGE" && rm -rf "$SOURCE_DIR"; fi'
+              if old in s:
+                  s = s.replace(old, new, 1)
+              elif new not in s:
+                  raise ValueError("unpack_fw.sh: unexpected AP cleanup structure")
+              unpacker.write_text(s)
+          
+              # Avoid bundling the root manager APK. The remaining ROM must still be
+              # independently audited for any other root mechanism.
+              ksu_dir = repo / "platform/m14x/KernelSU-Next"
+              if ksu_dir.exists():
+                  import shutil
+                  shutil.rmtree(ksu_dir)
+              (repo/"platform/m14x/kernel.sh").write_text(KERNEL_SCRIPT)
+          
+              print("CONFIGURED donor", DONOR)
+              print("CONFIGURED stock", STOCK)
+              print("Removed S24 FE optional donor and KernelSU-Next manager preload.")
+              print("Prepared stock M14 boot chain extraction (not validated for AVB).")
+              print("STATUS: EXPERIMENTAL SOURCE PATCH, NOT A VERIFIED FLASHABLE ROM.")
+          
+          def check(repo: Path):
+              s=(repo/"objectives/m14x/m14x.sh").read_text()
+              expected={
+                  "MODEL":"SM-A166B","CSC":"TUR", "STOCK_MODEL":"SM-M146B",
+                  "STOCK_CSC":"TUR","PORT_FIRMWARE":DONOR,"STOCK_FIRMWARE":STOCK,
+                  "EXTRA_MODEL":"","FILESYSTEM":"erofs"
+              }
+              for k,v in expected.items():
+                  if not re.search(rf'(?m)^{k}="{re.escape(v)}"$',s):
+                      raise AssertionError(f"Incorrect {k}")
+              assert not (repo/"platform/m14x/KernelSU-Next").exists(), "KernelSU preload still present"
+              assert 'REQUESTED_VERSION="${STOCK_FIRMWARE:-}"' in (repo/"scripts/utils/download_utils.sh").read_text()
+              assert '[[ "$FW_TYPE" != "stock" ]]' in (repo/"scripts/unpack_fw.sh").read_text()
+              assert "Stock M14 AP archive missing" in (repo/"platform/m14x/kernel.sh").read_text()
+              print("PASS: configuration checks; image/boot/IMS not tested")
+          
+          
+          apply(Path("/tmp/ReCoreUI"))
+          check(Path("/tmp/ReCoreUI"))
+          PY_PORT
+          bash -n /tmp/ReCoreUI/platform/m14x/kernel.sh
+          bash -n /tmp/ReCoreUI/build.sh
+
+      - name: Write build scope
+        run: |
+          cat > status.txt <<'EOF'
+          A16 One UI 8.5 -> M14 5G / SM-M146B
+          Donor: A166BXXSADZH1 (Android 16, TUR)
+          Stock: M146BXXSFDZI1 (Android 15, TUR)
+          This is an EXPERIMENTAL port candidate, NOT verified to boot.
+          Stock boot chain extracted at build stage, not independently AVB verified.
+          VoLTE / VoWiFi / brightness / rootlessness / SELinux not yet tested on hardware.
+          IMPORTANT: Do not flash any A16 BL or CP files to the M14.
+          EOF
+
+      - name: Check remaining storage
+        if: inputs.mode == 'build'
+        run: df -h /
+
+      - name: Free runner disk space for experimental build
+        if: inputs.mode == 'build'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker system prune -af || true
+          df -h /
+
+      - name: Build experimental ROM with upstream port engine
+        if: inputs.mode == 'build'
+        run: |
+          cd /tmp/ReCoreUI
+          sudo bash build.sh --build m14x
+
+
+      - name: Optional Gofile upload for successful candidate
+        if: inputs.mode == 'build'
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
+        run: |
+          if [ -z "$GOFILE_TOKEN" ]; then
+            echo "No GOFILE_TOKEN secret. ROM stays on runner and will not be downloadable." | tee upload-status.txt
+            exit 0
+          fi
+          ROM="$(find /tmp/ReCoreUI/out -maxdepth 2 -type f -name '*.zip' -print -quit)"
+          if [ -z "$ROM" ]; then
+            echo "No ROM zip was built." | tee upload-status.txt
+            exit 1
+          fi
+          # Gofile verified Free accounts limit each upload to 5 GB.
+          # Split at 4,500 MiB to keep each part under that limit.
+          mkdir -p /tmp/upload-parts
+          split -b 4500M -d -a 3 "$ROM" /tmp/upload-parts/$(basename "$ROM").part-
+          : > upload-status.txt
+          for PART in /tmp/upload-parts/*; do
+            ARGS=(-fsS --retry 2 --connect-timeout 30 --max-time 7200
+              -H "Authorization: Bearer $GOFILE_TOKEN" -F "file=@$PART")
+            if [ -n "$GOFILE_FOLDER_ID" ]; then
+              ARGS+=(-F "folderId=$GOFILE_FOLDER_ID")
+            fi
+            RESP="$(curl "${ARGS[@]}" https://upload.gofile.is/uploadfile)"
+            export RESP
+            python3 - <<'PY_GOFILE' >> upload-status.txt
+          import json, os
+          d=json.loads(os.environ["RESP"])
+          if d.get("status")!="ok":
+              raise SystemExit("Upload failed: "+str(d.get("status")))
+          print(d.get("data",{}).get("name"), d.get("data",{}).get("downloadPage"))
+          PY_GOFILE
+          done
+          printf 'Assemble downloaded parts in numerical order with cat > recovered.zip\n' >> upload-status.txt
+
+      - name: Record output file inventory (do not publish ROM automatically)
+        if: always()
+        run: |
+          find /tmp/ReCoreUI/out -maxdepth 2 -type f -printf '%P\t%s bytes\n' 2>/dev/null > output-files.txt || true
+          printf '\nBuild mode: %s\n' "${{ inputs.mode }}" >> status.txt
+
+      - name: Upload non-firmware logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m14-a16-oneui85-preflight
+          path: |
+            upstream-commit.txt
+            status.txt
+            output-files.txt
+            upload-status.txt
+          if-no-files-found: warn
