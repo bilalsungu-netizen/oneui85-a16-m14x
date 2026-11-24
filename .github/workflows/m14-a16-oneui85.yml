@@ -30,6 +30,44 @@ jobs:
 
       - name: Apply A16 donor / M14 stock patches (self-contained)
         run: |
+        # Workflow adimidir. Mevcut .github/workflows/m14-a16-oneui85.yml
+# dosyasinda "Apply A16 donor / M14 stock patches (self-contained)" adimindan
+# hemen sonra, "Write build scope" adimindan hemen once ekleyin.
+      - name: Fix A16-only source references (no extra donor)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          base = Path('/tmp/ReCoreUI/recore')
+
+          # A16 source already provides floating_feature.xml to WORKSPACE.
+          # No optional extra firmware is needed.
+          p = base / '_device_patches/_ff/Apply-Target-Floating-Feature.sh'
+          data = p.read_text()
+          old = 'ADD_FROM_FW "extra" "system" "etc/floating_feature.xml"'
+          assert data.count(old) == 1, 'Upstream floating-feature patch changed'
+          data = data.replace(old, '[[ -f "$WORKSPACE/system/system/etc/floating_feature.xml" ]] || ERROR_EXIT "Donor floating feature missing"')
+          data = data.replace('GET_FF_VAL "extra"', 'GET_FF_VAL "main"')
+          p.write_text(data)
+
+          # RRO naming should use the main A16 donor rather than absent extra firmware.
+          p = base / '_device_patches/rro/rro.sh'
+          data = p.read_text()
+          old = 'GET_FW_DIR "extra"'
+          assert data.count(old) == 1, 'Upstream RRO source changed'
+          p.write_text(data.replace(old, 'GET_FW_DIR "main"'))
+
+          # Optional heavy/flagship patches require extra firmware, which this
+          # lightweight A16 port intentionally does not use.
+          for rel in ('twentysix/Add-twentysix-Features.sh',
+                      'mods/spoofing/spoof.sh'):
+              p = base / rel
+              assert p.is_file(), f'Expected optional patch missing: {p}'
+              p.rename(p.with_suffix('.disabled'))
+
+          print('A16 main donor references corrected; extra-only mods disabled.')
+          PY
+
           python3 - <<'PY_PORT'
           #!/usr/bin/env python3
           """Apply a minimal, reviewable A16 One UI 8.5 donor conversion to ReCoreUI 8.5.
