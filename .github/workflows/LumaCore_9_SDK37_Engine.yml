@@ -1,0 +1,359 @@
+name: LumaCore 9.0 SDK37 Engine - M14
+run-name: "LumaCore 9 → M14: ${{ inputs.mode }}"
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight: only source patch verification; build: experimental ROM candidate"
+        required: true
+        type: choice
+        default: build
+        options:
+          - preflight
+          - build
+      delivery:
+        description: "ROM delivery; Actions artifacts may require storage quota"
+        required: true
+        type: choice
+        default: artifact
+        options:
+          - artifact
+          - gofile
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lumacore9-m14
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Checkout M14-compatible base engine (MIT)
+        run: |
+          git clone --depth 1 --branch 8.5 https://github.com/KrrishJaat/ReCoreUI.git /tmp/ReCoreUI
+          git -C /tmp/ReCoreUI rev-parse HEAD | tee upstream-commit.txt
+          cp /tmp/ReCoreUI/LICENSE upstream-LICENSE.txt
+
+      - name: Install SDK37 engine stages and M14 configuration
+        run: |
+          python3 - <<'PY_PORT'
+          #!/usr/bin/env python3
+          """Apply a minimal, reviewable A16 One UI 9.0 donor conversion to ReCoreUI 8.5.
+          
+          This prepares an experimental build. It does NOT validate boot, AVB or IMS.
+          Upstream project: https://github.com/KrrishJaat/ReCoreUI (MIT license).
+          """
+          from pathlib import Path
+          import argparse
+          import re
+          import sys
+          
+          ENGINE = '#!/usr/bin/env python3\n"""LumaCore SDK37 stage guard. Original code; MIT-compatible integration.\nNo HAL shims, signature bypass, APEX modification or security-service emulation.\n"""\nimport hashlib,json,re,sys,shutil,os,stat\nfrom pathlib import Path\n\nPARTS=(\'system\',\'system_ext\',\'product\',\'vendor\',\'odm\')\nNFC={\'NfcNci.apk\',\'SecNfc.apk\',\'libnfc_nci_jni.so\',\'libnfc_sec_jni.so\'}\nCRITICAL={\'libbluetooth_jni.so\',\'ssrm.jar\',\'com.android.bt.apex\',\'com.android.bt.capex\',\'com.android.nfc.apex\',\'com.android.nfc.capex\'}\ndef sha(p):\n    h=hashlib.sha256()\n    with p.open(\'rb\') as f:\n        for b in iter(lambda:f.read(1024*1024),b\'\'):h.update(b)\n    return h.hexdigest()\ndef prop(root,key):\n    vals=[]\n    for p in (root/\'build.prop\',root/\'system/build.prop\',root/\'etc/build.prop\'):\n        if p.is_file():\n            vals+=re.findall(r\'(?m)^\'+re.escape(key)+r\'=([^\\r\\n]+)\',p.read_text(errors=\'replace\'))\n    return sorted(set(vals))\ndef scan(roots):\n    out={}\n    for part,root in roots.items():\n        for d,dirs,files in os.walk(root,followlinks=False):\n            for name in files:\n                if name not in NFC|CRITICAL and not name.endswith((\'.apex\',\'.capex\')) and \'vaultkeeper\' not in name.lower():continue\n                p=Path(d)/name\n                if p.is_symlink() or not p.is_file():continue\n                rel=part+\'/\'+p.relative_to(root).as_posix()\n                out[rel]={\'sha256\':sha(p),\'size\':p.stat().st_size}\n    return out\n\ndef run(stage,state,roots):\n    sdk=prop(roots[\'system\'],\'ro.system.build.version.sdk\') or prop(roots[\'system\'],\'ro.build.version.sdk\')\n    if sdk!=[\'37\']:raise RuntimeError(\'Expected actual donor SDK 37, found \'+repr(sdk))\n    before=state/\'before.json\'; after=state/\'after.json\'; state.mkdir(parents=True,exist_ok=True)\n    inventory=scan(roots)\n    if stage==\'before\':\n        before.write_text(json.dumps({\'sdk\':sdk,\'files\':inventory},indent=2));return\n    base=json.loads(before.read_text())[\'files\']\n    # Android 17 packages must remain version-coherent. No copying SDK36 libraries.\n    # Report content changes, reject disappearance of original NFC/BT payloads or original APEX files.\n    missing=[p for p in base if p not in inventory]\n    modified=[p for p in base if p in inventory and base[p]!=inventory[p]]\n    lost=[p for p in missing if Path(p).name in NFC|CRITICAL or p.endswith((\'.apex\',\'.capex\'))]\n    changed_apex=[p for p in modified if p.endswith((\'.apex\',\'.capex\'))]\n    warnings=[]\n    if not any(Path(p).name==\'libnfc_nci_jni.so\' for p in inventory): warnings.append(\'NFC JNI not visible as loose file; inspect original APEX/APK contents and linker namespace before claiming NFC fixed\')\n    warnings+=[\'Bluetooth VaultKeeper HIDL/AIDL compatibility not established\',\'SSRM thermal policy not validated\',\'VINTF and device boot not validated\']\n    result={\'sdk\':sdk,\'missing\':missing,\'modified\':modified,\'added\':[p for p in inventory if p not in base],\'blocked_missing\':lost,\'blocked_apex_changes\':changed_apex,\'warnings\':warnings,\'status\':\'BLOCKED\' if lost or changed_apex else \'SDK37_STAGE_GUARD_PASS_NOT_DEVICE_VALIDATED\'}\n    after.write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))\n    if lost or changed_apex:raise RuntimeError(\'Critical SDK37 payload removed or APEX modified; inspect report; do not bypass guard\')\n    # Brand only display label. Preserve build fingerprint, security patch, actual SDK and signing.\n    for p in (roots[\'system\']/\'build.prop\',roots[\'system\']/\'system/build.prop\'):\n        if p.is_file():\n            old=p.read_bytes();new,n=re.subn(rb\'(?m)^ro\\.build\\.display\\.id=[^\\r\\n]*\',b\'ro.build.display.id=LumaCore 9.0 ALPHA\',old)\n            if n and old!=new:p.write_bytes(new)\n\ndef main():\n    if len(sys.argv)<4:raise SystemExit(\'usage: stage before|after state part=path ...\')\n    stage=sys.argv[1]; assert stage in (\'before\',\'after\');state=Path(sys.argv[2]);roots={}\n    for arg in sys.argv[3:]:\n        k,v=arg.split(\'=\',1);p=Path(v);assert k in PARTS and p.is_dir();roots[k]=p\n    if \'system\' not in roots:raise RuntimeError(\'Missing system tree\')\n    run(stage,state,roots)\nif __name__==\'__main__\':main()\n'
+          HOOK = '#!/usr/bin/env bash\n# Sourced in the builder shell. Do not alter global shell options.\nlc_stage() {\n    local stage="$1" part root\n    local -a args=()\n    for part in system system_ext product vendor odm; do\n        if root=$(GET_PARTITION_PATH "$part" 2>/dev/null) && [[ -d "$root" ]]; then\n            args+=("$part=$root")\n        fi\n    done\n    python3 "$RECOREUI/lumacore-sdk37.py" "$stage" /tmp/lumacore-sdk37-state "${args[@]}"\n}\nlc_stage "$1"\n'
+          DONOR = "A166BXXUAEZJ5/A166BOXMAEZJ5/A166BXXUAEZJ5/A166BXXUAEZJ5"
+          STOCK = "M146BXXSFDZI1/M146BOJMFDZI1/M146BXXSFDZI1/M146BXXSFDZI1"
+          
+          # Use the M14's UNMODIFIED, model-matched boot chain rather than the
+          # potentially root-enabled prebuilt boot images supplied by the port framework.
+          KERNEL_SCRIPT = r'''#!/usr/bin/env bash
+          # Experimental: take boot chain exclusively from the M14's stock AP package.
+          # NOTE: stock vbmeta may reject the modified system. Do not flash until
+          # AVB, kernel/system compatibility and rollback/recovery are audited.
+          # This script is sourced by the ReCoreUI builder: do not change shell options.
+          AP_DIR="${FW_BASE}/${STOCK_MODEL}_${STOCK_CSC}"
+          AP="$(find "$AP_DIR" -maxdepth 1 -type f \( -name 'AP_*.tar.md5' -o -name 'AP_*.tar' \) -print -quit)"
+          [[ -n "${AP:-}" && -s "$AP" ]] || { echo "Stock M14 AP archive missing"; return 1; }
+          
+          mkdir -p "$DIROUT"
+          for PART in boot init_boot vendor_boot dtbo vbmeta; do
+            ENTRY="$(tar -tf "$AP" | grep -E "(^|/)${PART}\.img\.lz4$" | head -n 1 || true)"
+            [[ -n "$ENTRY" ]] || { echo "Missing ${PART}.img.lz4 in stock AP"; return 1; }
+            TMP="$DIROUT/${PART}.img.tmp"
+            rm -f "$TMP"
+            if ! tar -xOf "$AP" "$ENTRY" | lz4 -dc > "$TMP"; then
+              echo "Decompression failed: ${PART}.img"
+              return 1
+            fi
+            [[ -s "$TMP" ]] || { echo "Empty ${PART}.img"; return 1; }
+            mv -f "$TMP" "$DIROUT/${PART}.img"
+            mkdir -p /tmp/lumacore-stock
+            cp "$DIROUT/${PART}.img" /tmp/lumacore-stock/
+          done
+          printf '%s\n' "Stock M14 boot components staged; AVB not validated."
+          '''
+          
+          def replace_assignment(s: str, key: str, value: str, required=True) -> str:
+              pattern = rf'(?m)^[ \t]*{re.escape(key)}="[^"\n]*"[ \t]*(?:#.*)?$'
+              replacement = f'{key}="{value}"'
+              if re.search(pattern, s):
+                  return re.sub(pattern, lambda _: replacement, s, count=1)
+              if required:
+                  raise ValueError(f"Upstream structure changed: {key} missing")
+              return s.rstrip() + "\n" + replacement + "\n"
+          
+          def apply(repo: Path):
+              required = [
+                  "build.sh", "objectives/m14x/m14x.sh",
+                  "scripts/utils/download_utils.sh", "scripts/unpack_fw.sh",
+                  "platform/m14x/kernel.sh",
+              ]
+              missing = [p for p in required if not (repo / p).is_file()]
+              if missing:
+                  raise FileNotFoundError("ReCoreUI 8.5 tree missing: " + ", ".join(missing))
+          
+              config = repo / "objectives/m14x/m14x.sh"
+              s = config.read_text()
+              for key, value in (
+                  ("MODEL", "SM-A166B"), ("CSC", "TUR"),
+                  ("PORT_FIRMWARE", DONOR),
+                  ("STOCK_MODEL", "SM-M146B"), ("STOCK_CSC", "TUR"),
+                  ("EXTRA_MODEL", ""), ("EXTRA_CSC", ""), ("EXTRA_FIRMWARE", ""),
+                  ("FILESYSTEM", "erofs"),
+              ):
+                  s = replace_assignment(s, key, value)
+              s = replace_assignment(s, "STOCK_FIRMWARE", STOCK, required=False)
+              config.write_text(s)
+          
+              downloader = repo / "scripts/utils/download_utils.sh"
+              s = downloader.read_text()
+              needle = '    elif [[ "${FW_PREFIX,,}" == "extra" ]]; then\n        REQUESTED_VERSION="$EXTRA_VERSION"'
+              if "REQUESTED_VERSION=\"${STOCK_FIRMWARE:-}\"" not in s:
+                  if needle not in s:
+                      raise ValueError("download_utils.sh: unexpected FETCH_FW structure")
+                  s = s.replace(needle, needle + '\n    elif [[ "${FW_PREFIX,,}" == "stock" ]]; then\n        REQUESTED_VERSION="${STOCK_FIRMWARE:-}"', 1)
+              downloader.write_text(s)
+          
+              unpacker = repo / "scripts/unpack_fw.sh"
+              s = unpacker.read_text()
+              old = 'if IS_GITHUB_ACTIONS; then rm -f "$AP_PACKAGE" && rm -rf "$SOURCE_DIR"; fi'
+              new = 'if IS_GITHUB_ACTIONS && [[ "$FW_TYPE" != "stock" ]]; then rm -f "$AP_PACKAGE" && rm -rf "$SOURCE_DIR"; fi'
+              if old in s:
+                  s = s.replace(old, new, 1)
+              elif new not in s:
+                  raise ValueError("unpack_fw.sh: unexpected AP cleanup structure")
+              unpacker.write_text(s)
+          
+              # Avoid bundling the root manager APK. The remaining ROM must still be
+              # independently audited for any other root mechanism.
+              ksu_dir = repo / "platform/m14x/KernelSU-Next"
+              if ksu_dir.exists():
+                  import shutil
+                  shutil.rmtree(ksu_dir)
+              (repo/"platform/m14x/kernel.sh").write_text(KERNEL_SCRIPT)
+          
+              # SDK37-specific stage engine, not a donor version rename.
+              (repo/'lumacore-sdk37.py').write_text(ENGINE)
+              hook = repo / 'lumacore-sdk37-hook.sh'
+              hook.write_text(HOOK)
+              builder = repo / 'build.sh'
+              bs = builder.read_text()
+              def once(old,new):
+                  nonlocal bs
+                  if bs.count(old)!=1: raise ValueError('SDK37 engine anchor changed: '+old)
+                  bs=bs.replace(old,new,1)
+              # Never overwrite shell PATH while merging metadata paths.
+              once('                    PATH=$(echo "$LINE" | awk \'{print $1}\')', '                    local LC_ENTRY; LC_ENTRY=$(echo "$LINE" | awk \'{print $1}\')')
+              once('                    if [[ -n "$PATH" ]]; then', '                    if [[ -n "$LC_ENTRY" ]]; then')
+              once('                        sed -i "\\|^$PATH |d" "$TARGET"', '                        sed -i "\\|^$LC_ENTRY |d" "$TARGET"')
+              # Preserve the actual exit code of a failed sourced patch.
+              once('    if ! source "$SCRIPT_FILE"; then\n        local RC=$?', '    source "$SCRIPT_FILE" || {\n        local RC=$?')
+              once('        ERROR_EXIT "Script failed in $SCRIPT_PATHS (exit $RC)"\n    fi','        ERROR_EXIT "Script failed in $SCRIPT_PATHS (exit $RC)"\n        return "$RC"\n    }')
+              once('    local LAYERS=()', '    source "$RECOREUI/lumacore-sdk37-hook.sh" before || ERROR_EXIT "SDK37 donor gate failed"\n    local LAYERS=()')
+              once('    REPACK_ROM "$FILESYSTEM" || ERROR_EXIT "Repack failed"','    source "$RECOREUI/lumacore-sdk37-hook.sh" after || ERROR_EXIT "SDK37 payload gate failed"\n    REPACK_ROM "$FILESYSTEM" || ERROR_EXIT "Repack failed"')
+              once('ROM_VERSION="8.6"','ROM_VERSION="9.0"')
+              builder.write_text(bs)
+              print("CONFIGURED donor", DONOR)
+              print("CONFIGURED stock", STOCK)
+              print("Removed S24 FE optional donor and KernelSU-Next manager preload.")
+              print("Prepared stock M14 boot chain extraction (not validated for AVB).")
+              print("STATUS: EXPERIMENTAL SOURCE PATCH, NOT A VERIFIED FLASHABLE ROM.")
+          
+          def check(repo: Path):
+              s=(repo/"objectives/m14x/m14x.sh").read_text()
+              expected={
+                  "MODEL":"SM-A166B","CSC":"TUR", "STOCK_MODEL":"SM-M146B",
+                  "STOCK_CSC":"TUR","PORT_FIRMWARE":DONOR,"STOCK_FIRMWARE":STOCK,
+                  "EXTRA_MODEL":"","FILESYSTEM":"erofs"
+              }
+              for k,v in expected.items():
+                  if not re.search(rf'(?m)^{k}="{re.escape(v)}"$',s):
+                      raise AssertionError(f"Incorrect {k}")
+              assert not (repo/"platform/m14x/KernelSU-Next").exists(), "KernelSU preload still present"
+              assert 'REQUESTED_VERSION="${STOCK_FIRMWARE:-}"' in (repo/"scripts/utils/download_utils.sh").read_text()
+              assert '[[ "$FW_TYPE" != "stock" ]]' in (repo/"scripts/unpack_fw.sh").read_text()
+              assert "Stock M14 AP archive missing" in (repo/"platform/m14x/kernel.sh").read_text()
+              print("PASS: configuration checks; image/boot/IMS not tested")
+          
+          
+          apply(Path("/tmp/ReCoreUI"))
+          check(Path("/tmp/ReCoreUI"))
+          PY_PORT
+          bash -n /tmp/ReCoreUI/platform/m14x/kernel.sh
+          bash -n /tmp/ReCoreUI/build.sh
+          bash -n /tmp/ReCoreUI/lumacore-sdk37-hook.sh
+          python3 -m py_compile /tmp/ReCoreUI/lumacore-sdk37.py
+          git -C /tmp/ReCoreUI diff --stat | tee patch-stat.txt
+
+      - name: Write build scope
+        run: |
+          cat > status.txt <<'EOF'
+          LumaCore SDK37 guarded engine v0.1 (ReCoreUI M14 base, not independent)
+          A16 One UI 9.0 -> M14 5G / SM-M146B
+          Donor: A166BXXUAEZJ5 (Android 17, TUR)
+          Stock: M146BXXSFDZI1 (Android 15, TUR)
+          This is an EXPERIMENTAL port candidate, NOT verified to boot.
+          Stock boot chain extracted at build stage, not independently AVB verified.
+          VoLTE / VoWiFi / brightness / rootlessness / SELinux not yet tested on hardware.
+          IMPORTANT: Do not flash any A16 BL or CP files to the M14.
+          EOF
+
+      - name: Check remaining storage
+        if: inputs.mode == 'build'
+        run: df -h /
+
+      - name: Free runner disk space for experimental build
+        if: inputs.mode == 'build'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker system prune -af || true
+          df -h /
+
+      - name: Build with LumaCore SDK37 guarded engine
+        if: inputs.mode == 'build'
+        run: |
+          cd /tmp/ReCoreUI
+          set -o pipefail
+          sudo bash build.sh --build m14x 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+
+      - name: Assemble one experimental ZIP with verified FIX2 installer
+        if: inputs.mode == 'build'
+        run: |
+          python3 - <<'PY_PACKAGE'
+          from pathlib import Path
+          import zipfile,hashlib,shutil,copy,subprocess,json,re,struct,os
+          ROOT=Path('/tmp/ReCoreUI'); ST=Path('/tmp/lumacore-stock'); WORK=Path(os.environ['GITHUB_WORKSPACE'])
+          OUT=ROOT/'out'; target=WORK/'LumaCore_9.0_M14_ALPHA_UNSIGNED.zip'
+          EXPECTED={'boot': 'c273ebc54038e9eb6cec23fd7d8c155dcd2579659fe6fa5ab5c5435a503ea865', 'vendor_boot': '17e7b5ab8d5b4ec7698f680b83309ae22be4fc8bd0df4ee2f58a02bfa3aae6c2', 'vbmeta': '4a17b7e724817f61c18b53aaed8478aaa5267528f3b8cfaca2d11be32d647d6a', 'dtbo': 'f04861880ec6556da692476a3891e9b4af2f4f107ada7c07e089ff1c48b18857', 'init_boot': 'fb64d7e5fdabb2ad120e0568fb50a3665ed52387b9359a7851829ffebcd704c3'}
+          CORE_SHA='0319372d11058ffc14bc5f38b412f56ced2784f8abb62a79d04c75705a48cfd7'
+          PARTS=['super','boot','init_boot','vendor_boot','vbmeta','dtbo','optics','prism']
+          SCRIPT='META-INF/com/google/android/updater-script'
+          PATCH='#MAGISK\nsetdefault   import_addons        off\nsetdefault   magisk_support       off\nsetdefault   extraction_speed     default\n\n#ReCoreUI script starts here:\nui_print " "\nui_print "Welcome to LumaCore Installer!"\nui_print " "\nui_print "LumaCore 9.0 ALPHA for Galaxy M14 5G  "\nui_print " "\nui_print "Based on ReCoreUI by @KrrishJaat (MIT) "\nui_print " "\nui_print "Build: 9.0 ALPHA"\n\n# FIX2: recovery only. No root manager or addon script is required.\n[[ "$BOOTMODE" == false ]] || abort "FIX2: install from recovery only"\n# Fail before any write if the device or destination is incorrect.\nfix_model="$(getprop ro.product.model) $(getprop ro.product.vendor.model) $(getprop ro.product.device) $(getprop ro.product.vendor.device) $(getprop ro.boot.em.model)"\ncase "$fix_model" in\n  *SM-M146B*) ;;\n  *) abort "FIX1: Galaxy M14 5G not identified; no partitions written" ;;\nesac\n# Store the validated destination for each partition and refuse aliases.\ndeclare -A fix_dest fix_size fix_hash\nfix_check() {\n  local part="$1" need="$2" expected="$3" dest cap ro prior\n  dest="$(find_block "$part")" || abort "FIX2: missing partition $part"\n  dest="$(readlink -f "$dest")" || abort "FIX2: cannot resolve $part"\n  [ -b "$dest" ] || abort "FIX2: not a block device: $part"\n  for prior in "${fix_dest[@]}"; do\n    [ "$prior" != "$dest" ] || abort "FIX2: duplicate destination $part"\n  done\n  cap="$(blockdev --getsize64 "$dest" 2>/dev/null)" || abort "FIX2: cannot read size: $part"\n  [[ "$cap" =~ ^[0-9]+$ ]] || abort "FIX2: invalid size: $part"\n  [ "$cap" -ge "$need" ] || abort "FIX2: insufficient capacity: $part"\n  ro="$(blockdev --getro "$dest" 2>/dev/null)" || abort "FIX2: cannot read write state: $part"\n  [ "$ro" = 0 ] || abort "FIX2: not writable: $part"\n  fix_dest[$part]="$dest"; fix_size[$part]="$need"; fix_hash[$part]="$expected"\n}\nfix_write() {\n  local part="$1" dest="${fix_dest[$1]}" need="${fix_size[$1]}" expected="${fix_hash[$1]}" got\n  [ -b "$dest" ] || abort "FIX2: invalid destination: $part"\n  [ "$(blockdev --getro "$dest" 2>/dev/null)" = 0 ] || abort "FIX2: not writable: $part"\n  # Use the same ZIP extraction tool as the original installer; propagate its status.\n  7z e "$installzip" "$part.img" -so -y -bd -bb2 -bso2 -bsp2 > "$dest" || abort "FIX2: write failed: $part"\n  sync || abort "FIX2: sync failed: $part"\n  got="$(set -o pipefail; head -c "$need" "$dest" | sha256sum)" || abort "FIX2: readback failed: $part"\n  [ "${got%% *}" = "$expected" ] || abort "FIX2: SHA256 mismatch: $part"\n  ui_print "FIX2: verified $part"\n}\n# Check required commands and their expected behavior before any partition writes.\nfor fix_tool in 7z blockdev head sha256sum sync readlink; do\n  command -v "$fix_tool" >/dev/null 2>&1 || abort "FIX2: missing tool $fix_tool"\ndone\nfix_probe="$(set -o pipefail; printf abc | head -c 3 | sha256sum)" || abort "FIX2: hash tool failure"\n[ "${fix_probe%% *}" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad ] || abort "FIX2: hash tool incompatible"\nif (set -o pipefail; false | true); then abort "FIX2: pipefail unsupported"; fi\n\n# Preflight all destinations before the first write.\nfix_check super @SIZE_super@ @HASH_super@\nfix_check boot @SIZE_boot@ @HASH_boot@\nfix_check init_boot @SIZE_init_boot@ @HASH_init_boot@\nfix_check vendor_boot @SIZE_vendor_boot@ @HASH_vendor_boot@\nfix_check vbmeta @SIZE_vbmeta@ @HASH_vbmeta@\nfix_check dtbo @SIZE_dtbo@ @HASH_dtbo@\nfix_check optics @SIZE_optics@ @HASH_optics@\nfix_check prism @SIZE_prism@ @HASH_prism@\n\nui_print "Installing experimental LumaCore 9.0..."\nfix_write super\nfix_write boot\nfix_write init_boot\nfix_write vendor_boot\nfix_write vbmeta\nfix_write dtbo\nfix_write optics\nfix_write prism\nui_print "All FIX2 image writes verified by SHA256."\n\n# Ending\n   ui_print " If you want to reboot to recovery, press vol + "\n   ui_print " If you want to close the installer, press vol - "\n   if $yes; then\n      run_program "$addons/reboot" recovery\n   else\n      end "Installer closed... "\n   fi\n'
+          def digest(f):
+              h=hashlib.sha256()
+              for b in iter(lambda:f.read(8*1024*1024),b''): h.update(b)
+              return h.hexdigest()
+          def fsha(p):
+              with p.open('rb') as f:return digest(f)
+          gate=json.loads(Path('/tmp/lumacore-sdk37-state/after.json').read_text())
+          assert gate['status']=='SDK37_STAGE_GUARD_PASS_NOT_DEVICE_VALIDATED', gate
+          for name in ('boot','init_boot','vendor_boot','dtbo'):
+              f=ST/(name+'.img')
+              assert fsha(f)==EXPECTED[name], f'Stock {name} differs from working SFDZI1 image'
+          # Match the already device-tested FIX2 AVB configuration exactly, or stop.
+          vb=(ST/'vbmeta.img').read_bytes()
+          assert len(vb)==65536 and vb[:4]==b'AVB0', 'Unexpected stock vbmeta format'
+          if hashlib.sha256(vb).hexdigest()!=EXPECTED['vbmeta']:
+              vb=vb[:120]+struct.pack('>I',3)+vb[124:]
+          assert hashlib.sha256(vb).hexdigest()==EXPECTED['vbmeta'], 'Cannot reproduce FIX2 vbmeta exactly; stop before packaging'
+          (ST/'vbmeta.img').write_bytes(vb)
+          roms=sorted(OUT.glob('*.zip'))
+          assert len(roms)==1, f'Expected one upstream ZIP, found {roms}'
+          src=roms[0]; sizes={}; hashes={}
+          with zipfile.ZipFile(src) as z:
+              names=z.namelist(); assert len(names)==len(set(names)), 'Duplicate ZIP entries'
+              assert hashlib.sha256(z.read('META-INF/zbin/core')).hexdigest()==CORE_SHA, 'Installer core differs from device-tested FIX2; review needed'
+              assert SCRIPT in names and 'META-INF/com/google/android/update-binary' in names
+              for name in names:
+                  if name.endswith('.img') and '/' not in name: assert name[:-4] in PARTS, f'Unknown image: {name}'
+              for part in PARTS:
+                  if part in EXPECTED:
+                      f=ST/(part+'.img'); sizes[part]=f.stat().st_size; hashes[part]=fsha(f)
+                  else:
+                      name=part+'.img'; sizes[part]=z.getinfo(name).file_size
+                      with z.open(name) as f: assert f.read(4)!=bytes.fromhex('3aff26ed'), f'Sparse {part} not supported by FIX2 raw writer'
+                      with z.open(name) as f: hashes[part]=digest(f)
+                  assert sizes[part]>0
+                  PATCH=PATCH.replace('@SIZE_'+part+'@',str(sizes[part])).replace('@HASH_'+part+'@',hashes[part])
+              assert sizes['super']<=8287944704, 'Super larger than previous working image; physical capacity needs confirmation'
+              assert '@HASH_' not in PATCH and '@SIZE_' not in PATCH
+              subprocess.run(['bash','-n'],input=PATCH,text=True,check=True)
+              with zipfile.ZipFile(target,'x',allowZip64=True,compression=zipfile.ZIP_DEFLATED,compresslevel=1) as dst:
+                  for i in z.infolist():
+                      n=i.filename
+                      if n in [k+'.img' for k in EXPECTED] or n==SCRIPT: continue
+                      if re.fullmatch(r'META-INF/[^/]+\.(SF|RSA|DSA|EC)',n,re.I) or n.upper()=='META-INF/MANIFEST.MF':continue
+                      if i.is_dir():dst.writestr(copy.copy(i),b'');continue
+                      with z.open(i) as a,dst.open(copy.copy(i),'w',force_zip64=i.file_size>=2**31) as b:shutil.copyfileobj(a,b,8*1024*1024)
+                  for part in EXPECTED:dst.write(ST/(part+'.img'),part+'.img')
+                  dst.writestr(SCRIPT,PATCH)
+                  dst.writestr('LumaCore-UPSTREAM-LICENSE.txt',(ROOT/'LICENSE').read_bytes())
+          with zipfile.ZipFile(target) as z:
+              assert z.testzip() is None
+              assert z.read(SCRIPT).decode()==PATCH
+              for part,sha in hashes.items():
+                  with z.open(part+'.img') as f: assert digest(f)==sha, part
+          report={'status':'EXPERIMENTAL_NOT_DEVICE_TESTED','file':target.name,'size':target.stat().st_size,'sha256':fsha(target),'images':hashes,'sizes':sizes,'stock_boot_chain_exact_match':True,'vbmeta_matches_previous_unsigned_FIX2':True,'installer_core_exact_match':True,'zip_crc':'PASS','boot_validated':False,'nfc_fixed':False,'bluetooth_fixed':False,'ssrm_fixed':False,'banking_validated':False}
+          (WORK/'LumaCore_9_Build_Result.json').write_text(json.dumps(report,indent=2))
+          print(json.dumps(report,indent=2))
+          PY_PACKAGE
+
+      - name: Upload candidate as GitHub artifact (one day)
+        if: inputs.mode == 'build' && inputs.delivery == 'artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LumaCore-9-M14-ALPHA
+          path: LumaCore_9.0_M14_ALPHA_UNSIGNED.zip
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Optional Gofile delivery (existing configured account)
+        if: inputs.mode == 'build' && inputs.delivery == 'gofile'
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$GOFILE_TOKEN" && test -n "$GOFILE_FOLDER_ID" || { echo 'Set existing GOFILE_TOKEN and private GOFILE_FOLDER_ID'; exit 1; }
+          ROM=LumaCore_9.0_M14_ALPHA_UNSIGNED.zip
+          split -b 4500M -d -a 3 "$ROM" /tmp/"$ROM".part-
+          : > upload-status.txt
+          for PART in /tmp/"$ROM".part-*; do
+            curl -fsS --retry 2 --max-time 7200 -H "Authorization: Bearer $GOFILE_TOKEN" -F "folderId=$GOFILE_FOLDER_ID" -F "file=@$PART" https://upload.gofile.is/uploadfile | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("status")=="ok", d.get("status"); print(d.get("data",{}).get("name"),d.get("data",{}).get("downloadPage"))' >> upload-status.txt
+            rm -f "$PART"
+          done
+          echo 'Join parts in numerical order and compare SHA256 from build result.' >> upload-status.txt
+
+      - name: Collect source and build logs
+        if: always()
+        run: |
+          cp /tmp/lumacore-sdk37-state/before.json sdk37-before.json 2>/dev/null || true
+          cp /tmp/lumacore-sdk37-state/after.json sdk37-after.json 2>/dev/null || true
+          find /tmp/ReCoreUI/out -maxdepth 2 -type f -printf '%P\t%s bytes\n' 2>/dev/null > output-files.txt || true
+
+      - name: Upload small result and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LumaCore-9-build-result
+          path: |
+            upstream-commit.txt
+            upstream-LICENSE.txt
+            patch-stat.txt
+            status.txt
+            build.log
+            output-files.txt
+            sdk37-before.json
+            sdk37-after.json
+            upload-status.txt
+            LumaCore_9_Build_Result.json
+          retention-days: 7
+          if-no-files-found: warn
