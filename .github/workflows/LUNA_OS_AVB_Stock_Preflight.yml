@@ -1,0 +1,126 @@
+name: LUNA OS - stock AVB preflight only
+run-name: LUNA OS M14 stock AVB comparison (no ROM build)
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+    - name: Prepare report directory
+      run: |-
+        mkdir -p avb-report
+        printf "%s\n" "SM-M146B / M146BXXSFDZI1 / read-only audit; no build or flash" > avb-report/scope.txt
+    - name: Checkout pinned upstream tools
+      run: |
+        set -euo pipefail
+        git clone --depth 1 --branch 8.5 https://github.com/KrrishJaat/ReCoreUI.git "$RUNNER_TEMP/ReCoreUI"
+        test "$(git -C "$RUNNER_TEMP/ReCoreUI" rev-parse HEAD)" = 26f16143e83cd30a490ad06bd952d469327dabed
+        git -C "$RUNNER_TEMP/ReCoreUI" rev-parse HEAD > avb-report/upstream-commit.txt
+        cp "$RUNNER_TEMP/ReCoreUI/LICENSE" avb-report/upstream-LICENSE.txt
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends lz4
+    - name: Download exact M14 stock firmware only
+      timeout-minutes: 45
+      run: |
+        set -euo pipefail
+        # Same pinned Samsung firmware downloader as the successful R17R3 engine.
+        cd "$RUNNER_TEMP"
+        "$RUNNER_TEMP/ReCoreUI/prebuilts/samloader/samloader" download --model SM-M146B --region TUR --version M146BXXSFDZI1/M146BOJMFDZI1/M146BXXSFDZI1/M146BXXSFDZI1 -o stock-fw.zip
+        python3 -m zipfile -l stock-fw.zip > "$GITHUB_WORKSPACE/avb-report/stock-archive-entries.txt"
+    - name: Extract AVB metadata and inspect installer without flashing
+      timeout-minutes: 25
+      run: |
+        set -euo pipefail
+        python3 - <<'PY_AVB'
+        import hashlib, json, os, pathlib, re, struct, subprocess, tarfile, zipfile
+        R=pathlib.Path('avb-report'); T=pathlib.Path(os.environ['RUNNER_TEMP']); U=T/'ReCoreUI'; W=T/'avb-small'; W.mkdir(exist_ok=True)
+        EXPECTED_STOCK='401d743e37ea89aad7f799abf8c1e7d81a463f46f503a5bef1cf669fbe4c191a'
+        EXPECTED_FIX2='4a17b7e724817f61c18b53aaed8478aaa5267528f3b8cfaca2d11be32d647d6a'
+        def sha(b): return hashlib.sha256(b).hexdigest()
+        def get(b,o,fmt): return struct.unpack_from('>'+fmt,b,o)[0]
+        def parse(b):
+            assert len(b)>=256 and b[:4]==b'AVB0','Invalid AVB header'
+            auth,aux=get(b,12,'Q'),get(b,20,'Q'); end=256+auth+aux
+            assert end<=len(b),'Truncated AVB data'
+            start=256+auth
+            do,ds=get(b,96,'Q'),get(b,104,'Q'); assert do+ds<=aux,'Descriptor range invalid'
+            pk,ps=get(b,64,'Q'),get(b,72,'Q'); assert pk+ps<=aux,'Key range invalid'
+            result={'size':len(b),'sha256':sha(b),'flags':get(b,120,'I'),'algorithm':get(b,28,'I'),'rollback_index':get(b,112,'Q'),'rollback_index_location':get(b,124,'I'),'embedded_key_sha256':sha(b[start+pk:start+pk+ps]),'descriptors':[]}
+            p=start+do; limit=p+ds
+            while p<limit:
+                assert p+16<=limit
+                tag,n=get(b,p,'Q'),get(b,p+8,'Q'); stop=p+16+n
+                assert stop<=limit and n%8==0,'Invalid descriptor size'
+                d=b[p+16:stop]; item={'tag':tag,'length':n,'sha256':sha(d)}
+                # AVB descriptor types 1, 2, 4: hashtree, hash, chain partition.
+                if tag==1:
+                    assert len(d)>=164
+                    ln,sl,dl=get(d,88,'I'),get(d,92,'I'),get(d,96,'I'); o=164
+                    assert o+ln+sl+dl<=len(d)
+                    item.update(type='hashtree',partition=d[o:o+ln].decode('ascii'),image_size=get(d,4,'Q'),root_digest=d[o+ln+sl:o+ln+sl+dl].hex())
+                elif tag==2:
+                    assert len(d)>=116
+                    ln,sl,dl=get(d,40,'I'),get(d,44,'I'),get(d,48,'I'); o=116
+                    assert o+ln+sl+dl<=len(d)
+                    item.update(type='hash',partition=d[o:o+ln].decode('ascii'),image_size=get(d,0,'Q'),digest=d[o+ln+sl:o+ln+sl+dl].hex())
+                elif tag==4:
+                    assert len(d)>=76
+                    ln,kl=get(d,4,'I'),get(d,8,'I'); o=76
+                    assert o+ln+kl<=len(d)
+                    item.update(type='chain',partition=d[o:o+ln].decode('ascii'),rollback_index_location=get(d,0,'I'),chain_key_sha256=sha(d[o+ln:o+ln+kl]))
+                result['descriptors'].append(item);p=stop
+            assert p==limit
+            return result
+        # Stream AP and BL from the official ZIP; no super.img extraction or ROM creation.
+        records={}; sources={}
+        with zipfile.ZipFile(T/'stock-fw.zip') as z:
+            members=[i for i in z.infolist() if re.fullmatch(r'(?:.*/)?(?:AP|BL)_[^/]+\.tar(?:\.md5)?',i.filename)]
+            ap=[i for i in members if pathlib.PurePosixPath(i.filename).name.startswith('AP_')]
+            assert len(ap)==1 and 'M146BXXSFDZI1' in ap[0].filename,'Exact AP firmware not found'
+            for i in members:
+                with z.open(i) as raw,tarfile.open(fileobj=raw,mode='r|') as tar:
+                    for m in tar:
+                        name=pathlib.PurePosixPath(m.name).name
+                        if not re.fullmatch(r'vbmeta(?:_[A-Za-z0-9_-]+)?\.img(?:\.lz4)?',name):continue
+                        assert m.isfile() and 0<m.size<=4*1024*1024,'Unexpected metadata member'
+                        b=tar.extractfile(m).read(); dest=name.removesuffix('.lz4')
+                        if name.endswith('.lz4'):
+                            b=subprocess.run(['lz4','-dc'],input=b,stdout=subprocess.PIPE,check=True,timeout=30).stdout
+                        assert len(b)<=4*1024*1024
+                        v=parse(b)
+                        if dest in records:assert records[dest]['sha256']==v['sha256'],'Conflicting copies of '+dest
+                        records[dest]=v;sources[dest]=i.filename+':'+m.name
+                        print('Read',dest,v['flags'],v['sha256'],flush=True)
+                        (R/'stock-avb.json').write_text(json.dumps({'images':records,'sources':sources},indent=2)+'\n')
+        assert 'vbmeta.img' in records,'Stock vbmeta missing'
+        old=parse((U/'platform/m14x/img/vbmeta.img').read_bytes()); assert old['sha256']==EXPECTED_FIX2
+        stock=records['vbmeta.img']; exact=stock['sha256']==EXPECTED_STOCK
+        # Compare chain keys only when a corresponding stock vbmeta child was extracted.
+        links=[]
+        for parent,v in records.items():
+            for d in v['descriptors']:
+                if d.get('type')!='chain':continue
+                child=records.get(d['partition']+'.img')
+                links.append({'parent':parent,'partition':d['partition'],'child_present':child is not None,'key_matches':None if child is None else child['embedded_key_sha256']==d['chain_key_sha256']})
+        report={'status':'METADATA_READ_ONLY_NOT_BOOT_TRUST_VERIFIED','stock_matches_R17R3':exact,'stock':stock,'previous_FIX2':old,'chain_links':links,'limitations':['No signature verification against a hardware root of trust','No verification of actual modified system partition data','Custom key acceptance on SM-M146B not established','No flash or ROM build']}
+        (R/'avb-comparison.json').write_text(json.dumps(report,indent=2)+'\n')
+        # Inspect the pinned installer source; no installer executable is run or released.
+        installer=U/'prebuilts/dynamic_installer/META-INF'; items=[]
+        for p in sorted(installer.rglob('*')):
+            if not p.is_file() or p.is_symlink():continue
+            b=p.read_bytes(); items.append({'path':str(p.relative_to(installer)),'bytes':len(b),'sha256':sha(b)})
+        (R/'installer-inventory.json').write_text(json.dumps(items,indent=2)+'\n')
+        assert exact,'Stock metadata differs from R17R3; review before proceeding'
+        print('Stock reference match. Read-only audit completed; not a release approval.')
+        PY_AVB
+    - name: Upload small audit reports even on failure
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: LUNA-OS-AVB-STOCK-PREFLIGHT
+        path: avb-report/
+        if-no-files-found: warn
+        retention-days: 7
