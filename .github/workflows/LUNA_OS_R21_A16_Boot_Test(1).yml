@@ -1,0 +1,638 @@
+name: LUNA OS 9 - R21 A16 boot isolation test
+run-name: LUNA OS R21 A16 donor boot isolation - FIX2 AVB3
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+    - name: Prepare GoFile upload helper
+      if: inputs.mode == 'build' && inputs.delivery == 'gofile'
+      env:
+        GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+        GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
+      run: |
+        set -euo pipefail
+        cat > "$RUNNER_TEMP/lumacore-gofile-upload.sh" <<'LC_UPLOAD'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        umask 077
+        file="$1"
+        report="$2"
+        : > "$report"
+        [[ -n "${GOFILE_TOKEN:-}" && -n "${GOFILE_FOLDER_ID:-}" ]] || { echo 'Missing GOFILE_TOKEN or GOFILE_FOLDER_ID' | tee -a "$report"; exit 1; }
+        [[ "$GOFILE_FOLDER_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || { echo 'GOFILE_FOLDER_ID must be the folder UUID, not the share code' | tee -a "$report"; exit 1; }
+        [[ -s "$file" ]] || { echo 'Upload file missing or empty' | tee -a "$report"; exit 1; }
+        response=$(mktemp)
+        trap 'rm -f "$response"' EXIT
+        # Do not follow redirects or send credentials to other domains. Do not print raw response.
+        if ! http=$(curl --silent --show-error --proto '=https' --connect-timeout 30 --max-time 7200 \
+            --output "$response" --write-out '%{http_code}' \
+            -H "Authorization: Bearer $GOFILE_TOKEN" \
+            --form-string "folderId=$GOFILE_FOLDER_ID" --form "file=@$file" \
+            'https://upload.gofile.io/uploadfile'); then
+          echo 'Transport error during GoFile.io upload; check your folder before retrying' | tee -a "$report"
+          exit 1
+        fi
+        python3 - "$response" "$http" "$file" <<'PY_RESPONSE' | tee -a "$report"
+        import json, sys, os, re, hashlib
+        from pathlib import Path
+        response, http, filename = sys.argv[1:]
+        p = Path(filename)
+        print('HTTP:', http)
+        try:
+            obj = json.loads(Path(response).read_text())
+            status = obj.get('status', '')
+        except (OSError, ValueError, AttributeError):
+            raise SystemExit('GoFile response was not valid JSON; inspect account in browser')
+        # Only report known-format status values; never dump raw responses or tokens.
+        if not isinstance(status, str) or not re.fullmatch(r'(ok|error-[A-Za-z0-9_-]{1,64})', status):
+            status = 'unrecognized'
+        print('API status:', status)
+        if not http.startswith('2') or status != 'ok':
+            raise SystemExit('Upload rejected; check API status and account/folder settings')
+        d = obj.get('data')
+        if not isinstance(d, dict): raise SystemExit('Missing upload metadata')
+        if d.get('name') != p.name: raise SystemExit('Returned filename mismatch')
+        if str(d.get('size')) != str(p.stat().st_size): raise SystemExit('Returned file size mismatch or missing')
+        if str(d.get('parentFolder','')).lower() != os.environ['GOFILE_FOLDER_ID'].lower():
+            raise SystemExit('Returned parent folder mismatch or missing')
+        remote_md5 = d.get('md5')
+        if not isinstance(remote_md5, str) or not re.fullmatch(r'[a-fA-F0-9]{32}', remote_md5):
+            raise SystemExit('Missing or invalid server MD5; upload not verified')
+        with p.open('rb') as f: local_md5 = hashlib.file_digest(f, 'md5').hexdigest()
+        if local_md5 != remote_md5.lower(): raise SystemExit('Server MD5 mismatch')
+        print('File:', p.name)
+        print('Bytes:', p.stat().st_size)
+        print('MD5:', local_md5)
+        print('UPLOAD_VERIFIED: server size and MD5 match local file')
+        print('Open your configured folder in https://gofile.io/ ; link is not published in public logs.')
+        PY_RESPONSE
+        LC_UPLOAD
+        [[ -n "${GOFILE_TOKEN:-}" && -n "${GOFILE_FOLDER_ID:-}" ]] || { echo "GoFile credentials missing"; exit 1; }
+        [[ "$GOFILE_FOLDER_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || { echo "GoFile folder ID must be UUID"; exit 1; }
+    - name: Checkout project
+      uses: actions/checkout@v4
+    - name: Checkout M14-compatible base engine (MIT)
+      run: |
+        git clone --depth 1 --branch 8.5 https://github.com/KrrishJaat/ReCoreUI.git /tmp/ReCoreUI
+        git -C /tmp/ReCoreUI rev-parse HEAD | tee upstream-commit.txt
+        test "$(cat upstream-commit.txt)" = 26f16143e83cd30a490ad06bd952d469327dabed
+        cp /tmp/ReCoreUI/LICENSE upstream-LICENSE.txt
+    - name: Preflight exact FIX2 AVB3 and installer reference
+      run: |
+        set -euo pipefail
+        python3 - <<'PY_PRE'
+        import hashlib,struct,ast,re
+        from pathlib import Path
+        p=Path('/tmp/ReCoreUI/platform/m14x/img/vbmeta.img'); b=p.read_bytes()
+        assert len(b)==65536 and b[:4]==b'AVB0' and struct.unpack_from('>I',b,120)[0]==3
+        assert hashlib.sha256(b).hexdigest()=='4a17b7e724817f61c18b53aaed8478aaa5267528f3b8cfaca2d11be32d647d6a'
+        core=Path('/tmp/ReCoreUI/prebuilts/dynamic_installer/META-INF/zbin/core')
+        assert hashlib.sha256(core.read_bytes()).hexdigest()=='0319372d11058ffc14bc5f38b412f56ced2784f8abb62a79d04c75705a48cfd7'
+        f=Path('.github/workflows/LumaCore_9_SDK37_v04_GoFile_IO.yml')
+        line=next(s.strip() for s in f.read_text().splitlines() if s.lstrip().startswith('PATCH='))
+        p=ast.literal_eval(ast.parse(line).body[0].value)
+        assert 'magisk_support       off' in p and 'import_addons        off' in p and 'SM-M146B' in p
+        assert set(re.findall(r'@SIZE_([a-z_]+)@',p))=={'super','boot','init_boot','vendor_boot','dtbo','optics','prism','vbmeta'}
+        print('Exact previous FIX2 AVB flags=3 and installer core verified; device boot NOT verified')
+        PY_PRE
+        if ! command -v 7z >/dev/null && ! command -v 7zz >/dev/null; then
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends p7zip-full
+        fi
+    - name: Install SDK37 engine stages and M14 configuration
+      run: |
+        python3 - <<'PY_PORT'
+        #!/usr/bin/env python3
+        """Apply a minimal, reviewable A17 One UI 9.0 donor conversion to ReCoreUI 8.5.
+
+        This prepares an experimental build. It does NOT validate boot, AVB or IMS.
+        Upstream project: https://github.com/KrrishJaat/ReCoreUI (MIT license).
+        """
+        from pathlib import Path
+        import argparse
+        import re
+        import sys
+
+        ENGINE = '#!/usr/bin/env python3\n"""LUNA OS SDK37 stage guard. Original code; MIT-compatible integration.\nNo HAL shims, signature bypass, APEX modification or security-service emulation.\n"""\nimport hashlib,json,re,sys,shutil,os,stat\nfrom pathlib import Path\n\nPARTS=(\'system\',\'system_ext\',\'product\',\'vendor\',\'odm\')\nNFC={\'NfcNci.apk\',\'SecNfc.apk\',\'libnfc_nci_jni.so\',\'libnfc_sec_jni.so\'}\nCRITICAL={\'libbluetooth_jni.so\',\'ssrm.jar\',\'com.android.bt.apex\',\'com.android.bt.capex\',\'com.android.nfc.apex\',\'com.android.nfc.capex\'}\ndef sha(p):\n    h=hashlib.sha256()\n    with p.open(\'rb\') as f:\n        for b in iter(lambda:f.read(1024*1024),b\'\'):h.update(b)\n    return h.hexdigest()\ndef prop(root,key):\n    vals=[]\n    for p in (root/\'build.prop\',root/\'system/build.prop\',root/\'etc/build.prop\'):\n        if p.is_file():\n            vals+=re.findall(r\'(?m)^\'+re.escape(key)+r\'=([^\\r\\n]+)\',p.read_text(errors=\'replace\'))\n    return sorted(set(vals))\ndef scan(roots):\n    out={}\n    for part,root in roots.items():\n        for d,dirs,files in os.walk(root,followlinks=False):\n            for name in files:\n                if name not in NFC|CRITICAL and not name.endswith((\'.apex\',\'.capex\')) and \'vaultkeeper\' not in name.lower():continue\n                p=Path(d)/name\n                if p.is_symlink() or not p.is_file():continue\n                rel=part+\'/\'+p.relative_to(root).as_posix()\n                out[rel]={\'sha256\':sha(p),\'size\':p.stat().st_size}\n    return out\n\ndef run(stage,state,roots):\n    sdk=prop(roots[\'system\'],\'ro.system.build.version.sdk\') or prop(roots[\'system\'],\'ro.build.version.sdk\')\n    if sdk!=[\'37\']:raise RuntimeError(\'Expected actual donor SDK 37, found \'+repr(sdk))\n    before=state/\'before.json\'; after=state/\'after.json\'; state.mkdir(parents=True,exist_ok=True)\n    inventory=scan(roots)\n    if stage==\'before\':\n        before.write_text(json.dumps({\'sdk\':sdk,\'files\':inventory},indent=2));return\n    base=json.loads(before.read_text())[\'files\']\n    # Android 17 packages must remain version-coherent. No copying SDK36 libraries.\n    # Report content changes, reject disappearance of original NFC/BT payloads or original APEX files.\n    missing=[p for p in base if p not in inventory]\n    modified=[p for p in base if p in inventory and base[p]!=inventory[p]]\n    lost=[p for p in missing if Path(p).name in NFC|CRITICAL or p.endswith((\'.apex\',\'.capex\'))]\n    changed_apex=[p for p in modified if p.endswith((\'.apex\',\'.capex\'))]\n    warnings=[]\n    if not any(Path(p).name==\'libnfc_nci_jni.so\' for p in inventory): warnings.append(\'NFC JNI not visible as loose file; inspect original APEX/APK contents and linker namespace before claiming NFC fixed\')\n    warnings+=[\'Bluetooth VaultKeeper HIDL/AIDL compatibility not established\',\'SSRM thermal policy not validated\',\'VINTF and device boot not validated\']\n    result={\'sdk\':sdk,\'missing\':missing,\'modified\':modified,\'added\':[p for p in inventory if p not in base],\'blocked_missing\':lost,\'blocked_apex_changes\':changed_apex,\'warnings\':warnings,\'status\':\'BLOCKED\' if lost or changed_apex else \'SDK37_STAGE_GUARD_PASS_NOT_DEVICE_VALIDATED\'}\n    after.write_text(json.dumps(result,indent=2));print(json.dumps(result,indent=2))\n    if lost or changed_apex:raise RuntimeError(\'Critical SDK37 payload removed or APEX modified; inspect report; do not bypass guard\')\n    # Brand only display label. Preserve build fingerprint, security patch, actual SDK and signing.\n    for p in (roots[\'system\']/\'build.prop\',roots[\'system\']/\'system/build.prop\'):\n        if p.is_file():\n            old=p.read_bytes();new,n=re.subn(rb\'(?m)^ro\\.build\\.display\\.id=[^\\r\\n]*\',b\'ro.build.display.id=LUNA OS 9.0 ALPHA\',old)\n            if n and old!=new:p.write_bytes(new)\n\ndef main():\n    if len(sys.argv)<4:raise SystemExit(\'usage: stage before|after state part=path ...\')\n    stage=sys.argv[1]; assert stage in (\'before\',\'after\');state=Path(sys.argv[2]);roots={}\n    for arg in sys.argv[3:]:\n        k,v=arg.split(\'=\',1);p=Path(v);assert k in PARTS and p.is_dir();roots[k]=p\n    if \'system\' not in roots:raise RuntimeError(\'Missing system tree\')\n    run(stage,state,roots)\nif __name__==\'__main__\':main()\n'
+        HOOK = '#!/usr/bin/env bash\n# Sourced in the builder shell. Do not alter global shell options.\nlc_stage() {\n    local stage="$1" part root\n    local -a args=()\n    for part in system system_ext product vendor odm; do\n        if root=$(GET_PARTITION_PATH "$part" 2>/dev/null) && [[ -d "$root" ]]; then\n            args+=("$part=$root")\n        fi\n    done\n    python3 "$RECOREUI/lunaos-sdk37.py" "$stage" /tmp/lunaos-sdk37-state "${args[@]}"\n}\nlc_stage "$1"\n'
+        DONOR = "A166BXXUAEZJ5/A166BOXMAEZJ5/A166BXXUAEZJ5/A166BXXUAEZJ5"
+        STOCK = "M146BXXSFDZI1/M146BOJMFDZI1/M146BXXSFDZI1/M146BXXSFDZI1"
+
+        # Use the M14's UNMODIFIED, model-matched boot chain rather than the
+        # potentially root-enabled prebuilt boot images supplied by the port framework.
+        KERNEL_SCRIPT = r'''#!/usr/bin/env bash
+        # Experimental: take boot chain exclusively from the M14's stock AP package.
+        # NOTE: stock vbmeta may reject the modified system. Do not flash until
+        # AVB, kernel/system compatibility and rollback/recovery are audited.
+        # This script is sourced by the ReCoreUI builder: do not change shell options.
+        AP_DIR="${FW_BASE}/${STOCK_MODEL}_${STOCK_CSC}"
+        AP="$(find "$AP_DIR" -maxdepth 1 -type f \( -name 'AP_*.tar.md5' -o -name 'AP_*.tar' \) -print -quit)"
+        [[ -n "${AP:-}" && -s "$AP" ]] || { echo "Stock M14 AP archive missing"; return 1; }
+
+        mkdir -p "$DIROUT"
+        for PART in boot init_boot vendor_boot dtbo vbmeta; do
+          ENTRY="$(tar -tf "$AP" | grep -E "(^|/)${PART}\.img\.lz4$" | head -n 1 || true)"
+          [[ -n "$ENTRY" ]] || { echo "Missing ${PART}.img.lz4 in stock AP"; return 1; }
+          TMP="$DIROUT/${PART}.img.tmp"
+          rm -f "$TMP"
+          if ! tar -xOf "$AP" "$ENTRY" | lz4 -dc > "$TMP"; then
+            echo "Decompression failed: ${PART}.img"
+            return 1
+          fi
+          [[ -s "$TMP" ]] || { echo "Empty ${PART}.img"; return 1; }
+          mv -f "$TMP" "$DIROUT/${PART}.img"
+          mkdir -p /tmp/lunaos-stock
+          cp "$DIROUT/${PART}.img" /tmp/lunaos-stock/
+        done
+        printf '%s\n' "Stock M14 boot components staged; AVB not validated."
+        '''
+
+        def replace_assignment(s: str, key: str, value: str, required=True) -> str:
+            pattern = rf'(?m)^[ \t]*{re.escape(key)}="[^"\n]*"[ \t]*(?:#.*)?$'
+            replacement = f'{key}="{value}"'
+            if re.search(pattern, s):
+                return re.sub(pattern, lambda _: replacement, s, count=1)
+            if required:
+                raise ValueError(f"Upstream structure changed: {key} missing")
+            return s.rstrip() + "\n" + replacement + "\n"
+
+        def apply(repo: Path):
+            required = [
+                "build.sh", "objectives/m14x/m14x.sh",
+                "scripts/utils/download_utils.sh", "scripts/unpack_fw.sh",
+                "platform/m14x/kernel.sh",
+            ]
+            missing = [p for p in required if not (repo / p).is_file()]
+            if missing:
+                raise FileNotFoundError("ReCoreUI 8.5 tree missing: " + ", ".join(missing))
+
+            config = repo / "objectives/m14x/m14x.sh"
+            s = config.read_text()
+            for key, value in (
+                ("MODEL", "SM-A166B"), ("CSC", "TUR"),
+                ("PORT_FIRMWARE", DONOR),
+                ("STOCK_MODEL", "SM-M146B"), ("STOCK_CSC", "TUR"),
+                ("EXTRA_MODEL", ""), ("EXTRA_CSC", ""), ("EXTRA_FIRMWARE", ""),
+                ("FILESYSTEM", "erofs"),
+            ):
+                s = replace_assignment(s, key, value)
+            s = replace_assignment(s, "STOCK_FIRMWARE", STOCK, required=False)
+            config.write_text(s)
+
+            downloader = repo / "scripts/utils/download_utils.sh"
+            s = downloader.read_text()
+            needle = '    elif [[ "${FW_PREFIX,,}" == "extra" ]]; then\n        REQUESTED_VERSION="$EXTRA_VERSION"'
+            if "REQUESTED_VERSION=\"${STOCK_FIRMWARE:-}\"" not in s:
+                if needle not in s:
+                    raise ValueError("download_utils.sh: unexpected FETCH_FW structure")
+                s = s.replace(needle, needle + '\n    elif [[ "${FW_PREFIX,,}" == "stock" ]]; then\n        REQUESTED_VERSION="${STOCK_FIRMWARE:-}"', 1)
+            downloader.write_text(s)
+
+            unpacker = repo / "scripts/unpack_fw.sh"
+            s = unpacker.read_text()
+            old = 'if IS_GITHUB_ACTIONS; then rm -f "$AP_PACKAGE" && rm -rf "$SOURCE_DIR"; fi'
+            new = 'if IS_GITHUB_ACTIONS && [[ "$FW_TYPE" != "stock" ]]; then rm -f "$AP_PACKAGE" && rm -rf "$SOURCE_DIR"; fi'
+            if old in s:
+                s = s.replace(old, new, 1)
+            elif new not in s:
+                raise ValueError("unpack_fw.sh: unexpected AP cleanup structure")
+            unpacker.write_text(s)
+
+            # Avoid bundling the root manager APK. The remaining ROM must still be
+            # independently audited for any other root mechanism.
+            ksu_dir = repo / "platform/m14x/KernelSU-Next"
+            if ksu_dir.exists():
+                import shutil
+                shutil.rmtree(ksu_dir)
+            (repo/"platform/m14x/kernel.sh").write_text(KERNEL_SCRIPT)
+
+            # Two-source build: the original FF script hardcodes an absent extra donor.
+            ff = repo / 'recore/_device_patches/_ff/Apply-Target-Floating-Feature.sh'
+            ffs = ff.read_text()
+            for old, new in (
+                ('GET_FF_VAL "extra" "$FEATURE"', 'GET_FF_VAL "main" "$FEATURE"'),
+                ('ADD_FROM_FW "extra" "system" "etc/floating_feature.xml"',
+                 'ADD_FROM_FW "main" "system" "etc/floating_feature.xml"'),
+            ):
+                if ffs.count(old) != 1:
+                    raise ValueError('Unexpected floating feature source: '+old)
+                ffs = ffs.replace(old, new, 1)
+            ff.write_text(ffs)
+            print('LUNA OS: floating feature donor = main A17; stock M14 values retained')
+
+            # SDK37 v0.3: RROs originate from the main A17 donor, not EXTRA.
+            rro = repo / 'recore/_device_patches/rro/rro.sh'
+            rros = rro.read_text()
+            for old, new in (
+                ('_GET_EXTRA_PROP', '_LC_GET_MAIN_PROP'),
+                ('EXTRA_ROOT', 'MAIN_ROOT'),
+                ('GET_FW_DIR "extra"', 'GET_FW_DIR "main"'),
+                ('EXTRA build.prop: ro.product.system.name not found',
+                 'MAIN A17 build.prop: ro.product.system.name not found'),
+                ('unset -f _GET_EXTRA_BUILD_PROP', 'unset -f _LC_GET_MAIN_PROP _GET_CURRENT_PROP _GET_BUILD_PROP_FROM_DIR'),
+            ):
+                if old not in rros:
+                    raise ValueError('Unexpected RRO source: '+old)
+                rros = rros.replace(old, new)
+            rro.write_text(rros)
+            print('LUNA OS: RRO donor = main A17; target = M14 vendor')
+
+            # This optional flagship feature layer requires a third donor.
+            # It also contains a dependent SecSettings smali patch. Omit both
+            # rather than copying unrelated A17 files or forcing unsupported AI.
+            import shutil
+            flagship = repo / 'recore/twentysix'
+            expected_flagship = {
+                'Add-twentysix-Features.sh',
+                'SecSettings.apk/Enable-SEAD-Toggle.smalipatch',
+            }
+            actual_flagship = {
+                p.relative_to(flagship).as_posix()
+                for p in flagship.rglob('*') if p.is_file()
+            }
+            if actual_flagship != expected_flagship:
+                raise ValueError('Unexpected optional flagship module contents: '+repr(actual_flagship))
+            shutil.rmtree(flagship)
+            print('LUNA OS: optional EXTRA-dependent flagship module omitted')
+
+            # SDK37-specific stage engine, not a donor version rename.
+            (repo/'lunaos-sdk37.py').write_text(ENGINE)
+            hook = repo / 'lunaos-sdk37-hook.sh'
+            hook.write_text(HOOK)
+            builder = repo / 'build.sh'
+            bs = builder.read_text()
+            def once(old,new):
+                nonlocal bs
+                if bs.count(old)!=1: raise ValueError('SDK37 engine anchor changed: '+old)
+                bs=bs.replace(old,new,1)
+            # Never overwrite shell PATH while merging metadata paths.
+            once('                    PATH=$(echo "$LINE" | awk \'{print $1}\')', '                    local LC_ENTRY; LC_ENTRY=$(echo "$LINE" | awk \'{print $1}\')')
+            once('                    if [[ -n "$PATH" ]]; then', '                    if [[ -n "$LC_ENTRY" ]]; then')
+            once('                        sed -i "\\|^$PATH |d" "$TARGET"', '                        sed -i "\\|^$LC_ENTRY |d" "$TARGET"')
+            # Preserve the actual exit code of a failed sourced patch.
+            once('    if ! source "$SCRIPT_FILE"; then\n        local RC=$?', '    source "$SCRIPT_FILE" || {\n        local RC=$?')
+            once('        ERROR_EXIT "Script failed in $SCRIPT_PATHS (exit $RC)"\n    fi','        ERROR_EXIT "Script failed in $SCRIPT_PATHS (exit $RC)"\n        return "$RC"\n    }')
+            once('    local LAYERS=()', '    source "$RECOREUI/lunaos-sdk37-hook.sh" before || ERROR_EXIT "SDK37 donor gate failed"\n    local LAYERS=()')
+            once('    REPACK_ROM "$FILESYSTEM" || ERROR_EXIT "Repack failed"','    source "$RECOREUI/lunaos-sdk37-hook.sh" after || ERROR_EXIT "SDK37 payload gate failed"\n    REPACK_ROM "$FILESYSTEM" || ERROR_EXIT "Repack failed"')
+            once('ROM_VERSION="8.6"','ROM_VERSION="9.0"')
+            builder.write_text(bs)
+            print("CONFIGURED donor", DONOR)
+            print("CONFIGURED stock", STOCK)
+            print("Removed S24 FE optional donor and KernelSU-Next manager preload.")
+            print("Prepared stock M14 boot chain extraction (not validated for AVB).")
+            print("STATUS: EXPERIMENTAL SOURCE PATCH, NOT A VERIFIED FLASHABLE ROM.")
+
+        def check(repo: Path):
+            s=(repo/"objectives/m14x/m14x.sh").read_text()
+            expected={
+                "MODEL":"SM-A166B","CSC":"TUR", "STOCK_MODEL":"SM-M146B",
+                "STOCK_CSC":"TUR","PORT_FIRMWARE":DONOR,"STOCK_FIRMWARE":STOCK,
+                "EXTRA_MODEL":"","FILESYSTEM":"erofs"
+            }
+            for k,v in expected.items():
+                if not re.search(rf'(?m)^{k}="{re.escape(v)}"$',s):
+                    raise AssertionError(f"Incorrect {k}")
+            assert not (repo/"platform/m14x/KernelSU-Next").exists(), "KernelSU preload still present"
+            assert 'REQUESTED_VERSION="${STOCK_FIRMWARE:-}"' in (repo/"scripts/utils/download_utils.sh").read_text()
+            assert '[[ "$FW_TYPE" != "stock" ]]' in (repo/"scripts/unpack_fw.sh").read_text()
+            assert "Stock M14 AP archive missing" in (repo/"platform/m14x/kernel.sh").read_text()
+            rro = (repo/"recore/_device_patches/rro/rro.sh").read_text()
+            assert 'GET_FW_DIR "main"' in rro and 'GET_FW_DIR "extra"' not in rro
+            assert not (repo/"recore/twentysix").exists()
+            print("PASS: configuration checks; image/boot/IMS not tested")
+
+
+        apply(Path("/tmp/ReCoreUI"))
+        check(Path("/tmp/ReCoreUI"))
+        PY_PORT
+        bash -n /tmp/ReCoreUI/platform/m14x/kernel.sh
+        bash -n /tmp/ReCoreUI/build.sh
+        bash -n /tmp/ReCoreUI/recore/_device_patches/_ff/Apply-Target-Floating-Feature.sh
+        bash -n /tmp/ReCoreUI/recore/_device_patches/rro/rro.sh
+        bash -n /tmp/ReCoreUI/lunaos-sdk37-hook.sh
+        python3 -m py_compile /tmp/ReCoreUI/lunaos-sdk37.py
+        git -C /tmp/ReCoreUI diff --stat | tee patch-stat.txt
+    - name: Isolate known unsafe legacy modifications
+      run: |
+        python3 - <<'PY_CLEAN'
+        from pathlib import Path
+        import hashlib, json, subprocess
+        root=Path('/tmp/ReCoreUI')
+        # Exact paths from the pinned upstream tree. Do not modify proprietary
+        # firmware blobs, APEX packages, or runtime security checks.
+        drop=[
+            'recore/_device_patches/selinux/Remove-unsupported_entries.sh',
+            'recore/_nuke_bloat/Debloat.sh',
+            'recore/bt-lib/Patch-Bluetooth-library.sh',
+            'recore/knox/Remove-knox-traces.sh',
+            'recore/knox/knoxguard/services.jar/Fix-KnoxGuard.smalipatch',
+            'recore/knox/private-share/samsungkeystoreutils.jar/Bypass-Integrity-Verification.smalipatch',
+            'recore/knox/secure-folder/services.jar/Fix-Secure-Folder.smalipatch',
+            'recore/knox/secure-wifi/samsungkeystoreutils.jar/Bypass-Integrity-Verification.smalipatch',
+            'recore/knox/shealth/knoxsdk.jar/Fix-SHealth-App.smalipatch',
+            'recore/knox/smartview/set_wlan_props.sh',
+            'recore/misc/encryption/Remove-samsung-encrytion.sh',
+            'recore/mods/SecSettings.apk/Disable-Font-APK-Verification.smalipatch',
+            'recore/mods/SecSettings.apk/Set-Sysscope-To-Official.smalipatch',
+            'recore/mods/secure_flag/services.jar/Force-Disable-Secure-Screen.smalipatch',
+            'recore/mods/signature/framework.jar/Disable-Signature-Verification.smalipatch',
+            'recore/mods/spoofing/spoof.sh',
+            'objectives/m14x/patches/remove_fstab_avb.sh',
+        ]
+        for rel in drop:
+            p=root/rel
+            assert p.is_file() and not p.is_symlink(), 'Unexpected upstream tree: '+rel
+        records={}
+        for rel in drop:
+            p=root/rel
+            records[rel]=hashlib.sha256(p.read_bytes()).hexdigest()
+            p.unlink()
+        misc=root/'recore/misc/_misc_patches.sh'
+        s=misc.read_text()
+        for part in ('system','vendor'):
+            old=f'BPROP "{part}" "ro.adb.secure" "0"'
+            assert s.count(old)==1, 'ADB patch anchor mismatch'
+            s=s.replace(old,'# Preserve original ADB authentication',1)
+        misc.write_text(s)
+        subprocess.run(['bash','-n',str(misc)],check=True)
+        assert not any((root/p).exists() for p in drop)
+        Path('alpha2-source-cleanup.json').write_text(json.dumps({'status':'KNOWN_PATCHES_REMOVED_SOURCE_ONLY','removed':records,'adb_override_removed':True,'limitations':['No comprehensive security audit','No AVB or SELinux compatibility proof','No device testing','Unmodified donor security checks may expose compatibility failures']},indent=2))
+        print('Known legacy changes isolated:',len(records))
+        PY_CLEAN
+        git -C /tmp/ReCoreUI diff --stat | tee patch-stat.txt
+    - name: Install exact SFDZI1 boot provenance guard
+      run: |
+        set -euo pipefail
+        python3 - <<'PY_GUARD_INSTALL'
+        from pathlib import Path
+        root=Path('/tmp/ReCoreUI')
+        guard=r'''import hashlib,json,subprocess,sys,tarfile
+        from pathlib import Path
+        names=('boot','init_boot','vendor_boot','dtbo','vbmeta')
+        expected_vb='401d743e37ea89aad7f799abf8c1e7d81a463f46f503a5bef1cf669fbe4c191a'
+        old={'boot':'c273ebc54038e9eb6cec23fd7d8c155dcd2579659fe6fa5ab5c5435a503ea865','init_boot':'fb64d7e5fdabb2ad120e0568fb50a3665ed52387b9359a7851829ffebcd704c3','vendor_boot':'17e7b5ab8d5b4ec7698f680b83309ae22be4fc8bd0df4ee2f58a02bfa3aae6c2','dtbo':'f04861880ec6556da692476a3891e9b4af2f4f107ada7c07e089ff1c48b18857'}
+        R=Path('/tmp/luna-r17-reports'); R.mkdir(parents=True,exist_ok=True)
+        report=R/'r20r1-stock-chain.json'
+        def sha(p):
+            with p.open('rb') as f: return hashlib.file_digest(f,'sha256').hexdigest()
+        def verify(out,records):
+            actual={n:sha(out/(n+'.img')) for n in names}
+            assert all(actual[n]==records[n]['sha256'] for n in names), 'Stock chain changed: '+repr(actual)
+        if sys.argv[1]=='capture':
+            ap=Path(sys.argv[2]); out=Path(sys.argv[3])
+            assert ap.name=='AP_M146BXXSFDZI1_M146BXXSFDZI1_MQB114858415_REV00_user_low_ship_MULTI_CERT_meta_OS15.tar.md5', 'Unexpected stock AP: '+ap.name
+            assert ap.parent.name=='SM-M146B_TUR', 'Unexpected AP directory'
+            records={}
+            with tarfile.open(ap,'r:') as tar:
+                members=tar.getmembers()
+                for n in names:
+                    matches=[m for m in members if m.isfile() and Path(m.name).name==n+'.img.lz4']
+                    assert len(matches)==1, 'Missing or ambiguous AP entry: '+n
+                    with tar.extractfile(matches[0]) as f:
+                        data=subprocess.run(['lz4','-dc'],input=f.read(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True).stdout
+                    assert data, n
+                    h=hashlib.sha256(data).hexdigest()
+                    records[n]={'sha256':h,'size':len(data),'old_expected':old.get(n),'matches_old_reference':h==old[n] if n in old else None}
+                    print(n, len(data), h, 'old reference', records[n]['matches_old_reference'],flush=True)
+            report.write_text(json.dumps({'ap':ap.name,'records':records,'status':'CAPTURED_NOT_YET_VERIFIED'},indent=2))
+            assert records['vbmeta']['sha256']==expected_vb, 'Stock vbmeta does not match pinned SFDZI1 reference'
+            assert all(records[n]['sha256']==h for n,h in old.items()), 'Stock boot chain differs from original A16 reference'
+            verify(out,records)
+            verify(Path('/tmp/lunaos-stock'),records)
+            report.write_text(json.dumps({'ap':ap.name,'records':records,'status':'EXACT_STOCK_AP_MATCH'},indent=2))
+        elif sys.argv[1]=='staged':
+            j=json.loads(report.read_text()); assert j['status']=='EXACT_STOCK_AP_MATCH'
+            verify(Path(sys.argv[2]),j['records'])
+            verify(Path('/tmp/lunaos-stock'),j['records'])
+        else:
+            raise SystemExit('unknown guard mode')
+        '''
+        (root/'lunaos-stock-guard.py').write_text(guard)
+        kernel=root/'platform/m14x/kernel.sh'
+        s=kernel.read_text()
+        assert s.count('Stock M14 boot components staged; AVB not validated.')==1
+        s += '\npython3 "$RECOREUI/lunaos-stock-guard.py" capture "$AP" "$DIROUT" || return 1\n'
+        kernel.write_text(s)
+        builder=root/'build.sh'; s=builder.read_text()
+        anchor='    REPACK_ROM "$FILESYSTEM" || ERROR_EXIT "Repack failed"'
+        assert s.count(anchor)==1
+        s=s.replace(anchor,'    python3 "$RECOREUI/lunaos-stock-guard.py" staged "$DIROUT" || { ERROR_EXIT "Stock boot provenance check failed"; return 1; }\n'+anchor)
+        builder.write_text(s)
+        PY_GUARD_INSTALL
+        python3 -m py_compile /tmp/ReCoreUI/lunaos-stock-guard.py
+        bash -n /tmp/ReCoreUI/platform/m14x/kernel.sh
+        bash -n /tmp/ReCoreUI/build.sh
+    - name: Write build scope
+      run: |
+        printf '%s\n' 'R21 A16: boot-isolation test; A166BXXUAEZJ5 donor; R15/R17 donor-specific changes omitted; security cleanup retained; no OTA or device validation' > status.txt
+    - name: Free runner storage
+      if: inputs.mode == 'build'
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker system prune -af || true
+        df -h /
+    - name: Build LUNA OS Android 17 from A16 donor
+      if: inputs.mode == 'build'
+      run: |
+        cd /tmp/ReCoreUI
+        set -o pipefail
+        sudo bash build.sh --build m14x 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+    - name: Read back six EROFS partitions
+      if: inputs.mode == 'build'
+      run: |
+        set -euo pipefail
+        python3 - <<'PY_VERIFY'
+        import zipfile,shutil,subprocess,hashlib,json,tempfile,os
+        from pathlib import Path
+        root=Path('/tmp/ReCoreUI');R=Path('/tmp/luna-r17-reports');zips=list((root/'out').glob('*.zip'));assert len(zips)==1
+        with tempfile.TemporaryDirectory(prefix='luna-final-') as td:
+            t=Path(td); imgs=t/'images';imgs.mkdir(); super=t/'super.img'
+            with zipfile.ZipFile(zips[0]) as z:
+                i=z.getinfo('super.img'); assert i.file_size<=8287944704
+                assert shutil.disk_usage(t).free>i.file_size+7*2**30,'Insufficient local space for readback; stop without delivery'
+                with z.open(i) as f,super.open('wb') as g:shutil.copyfileobj(f,g,8*1024*1024)
+            tools=root/'prebuilts/android-tools';fsck=root/'prebuilts/erofs-utils/fsck.erofs'
+            def run(cmd,name):
+                with (R/name).open('w') as f:subprocess.run(list(map(str,cmd)),stdout=f,stderr=subprocess.STDOUT,check=True,timeout=1800)
+            run([tools/'lpdump',super],'final-lpdump.txt');run([tools/'lpunpack',super,imgs],'final-lpunpack.txt')
+            records={}
+            for name in ('system','product','vendor','odm','system_dlkm','vendor_dlkm'):
+                p=imgs/(name+'.img');assert p.is_file(),name
+                run([fsck,p],'final-fsck-'+name+'.txt')
+                with p.open('rb') as f: h=hashlib.file_digest(f,'sha256').hexdigest()
+                records[name]={'size':p.stat().st_size,'sha256':h}
+            (R/'final-erofs.json').write_text(json.dumps(records,indent=2))
+        PY_VERIFY
+    - name: Package fresh ROM with exact prior FIX2 AVB3 and guarded installer
+      if: inputs.mode == 'build'
+      run: |
+        set -euo pipefail
+        python3 - <<'PY_PACKAGE'
+        import hashlib,json,os,shutil,struct,subprocess,zipfile
+        from pathlib import Path
+        root=Path('/tmp/ReCoreUI'); work=Path(os.environ['GITHUB_WORKSPACE'])
+        R=Path('/tmp/luna-r17-reports'); R.mkdir(exist_ok=True,parents=True)
+        EXPECTED={'boot':'c273ebc54038e9eb6cec23fd7d8c155dcd2579659fe6fa5ab5c5435a503ea865','init_boot':'fb64d7e5fdabb2ad120e0568fb50a3665ed52387b9359a7851829ffebcd704c3','vendor_boot':'17e7b5ab8d5b4ec7698f680b83309ae22be4fc8bd0df4ee2f58a02bfa3aae6c2','dtbo':'f04861880ec6556da692476a3891e9b4af2f4f107ada7c07e089ff1c48b18857','vbmeta':'4a17b7e724817f61c18b53aaed8478aaa5267528f3b8cfaca2d11be32d647d6a'}
+        STOCK_VB='401d743e37ea89aad7f799abf8c1e7d81a463f46f503a5bef1cf669fbe4c191a'
+        provenance=json.loads((R/'r20r1-stock-chain.json').read_text())
+        assert provenance['status']=='EXACT_STOCK_AP_MATCH' and provenance['records']['vbmeta']['sha256']==STOCK_VB
+        assert set(provenance['records'])=={'boot','init_boot','vendor_boot','dtbo','vbmeta'}
+        for part in ('boot','init_boot','vendor_boot','dtbo'):
+            EXPECTED[part]=provenance['records'][part]['sha256']
+        CORE='0319372d11058ffc14bc5f38b412f56ced2784f8abb62a79d04c75705a48cfd7'
+        PARTS=('super','boot','init_boot','vendor_boot','dtbo','optics','prism','vbmeta')
+        SCRIPT='META-INF/com/google/android/updater-script'
+        TARGET=work/'LUNA_OS_9_R21_A16_BOOT_TEST.zip'
+        def digest(f): return hashlib.file_digest(f,'sha256').hexdigest()
+        def fsha(p):
+            with p.open('rb') as f:return digest(f)
+        # Preserve all R17R3 safety checks; AVB change is limited to the exact known FIX2 image.
+        log=(work/'build.log').read_text(errors='replace')
+        forbidden=('Applying Disable-Signature-Verification.smalipatch','Applying Bypass-Integrity-Verification.smalipatch','Applying Fix-KnoxGuard.smalipatch','Applying Force-Disable-Secure-Screen.smalipatch','Removing Samsung Encryption','Removing AVB flags from fstab','Applying Remove-knox-traces.sh')
+        assert not any(x in log for x in forbidden),'Unexpected legacy patch in log'
+        assert json.loads(Path('/tmp/lunaos-sdk37-state/after.json').read_text())['status']=='SDK37_STAGE_GUARD_PASS_NOT_DEVICE_VALIDATED'
+        assert set(json.loads((R/'final-erofs.json').read_text()))=={'system','product','vendor','odm','system_dlkm','vendor_dlkm'}
+        vb=root/'platform/m14x/img/vbmeta.img'; raw=vb.read_bytes()
+        assert len(raw)==65536 and raw[:4]==b'AVB0' and struct.unpack_from('>I',raw,120)[0]==3 and fsha(vb)==EXPECTED['vbmeta'],'Exact known FIX2 AVB image unavailable'
+        roms=list((root/'out').glob('*.zip'));assert len(roms)==1,roms
+        # The old FIX2 updater template is stored in the user's checked-out repository.
+        # Parse its string literal only; never execute the old workflow or download its ROM.
+        import ast,re
+        old=work/'.github/workflows/LumaCore_9_SDK37_v04_GoFile_IO.yml'
+        line=next(s.strip() for s in old.read_text().splitlines() if s.lstrip().startswith('PATCH='))
+        tree=ast.parse(line); assert len(tree.body)==1 and isinstance(tree.body[0],ast.Assign)
+        patch=ast.literal_eval(tree.body[0].value); assert isinstance(patch,str)
+        assert 'magisk_support       off' in patch and 'import_addons        off' in patch and 'SM-M146B' in patch
+        assert '7z e "$installzip" "$part.img"' in patch and 'SHA256 mismatch' in patch and 'blockdev --getsize64' in patch
+        assert set(re.findall(r'@SIZE_([a-z_]+)@',patch))==set(PARTS)
+        assert set(re.findall(r'@HASH_([a-z_]+)@',patch))==set(PARTS)
+        # Keep the device-tested FIX2 preflight/writer; write vbmeta last, after payloads.
+        assert patch.count('fix_write vbmeta\n')==1 and patch.count('fix_write prism\n')==1
+        patch=patch.replace('fix_write vbmeta\n','',1).replace('fix_write prism\n','fix_write prism\nfix_write vbmeta\n',1)
+        patch=patch.replace('LumaCore','LUNA OS').replace('9.0 ALPHA','9.0 R21_A16 AVB3 TEST')
+        records={}
+        with zipfile.ZipFile(roms[0]) as src:
+            names=src.namelist();assert len(names)==len(set(names)),'Duplicate source ZIP entry'
+            assert hashlib.sha256(src.read('META-INF/zbin/core')).hexdigest()==CORE,'Installer core changed'
+            assert SCRIPT in names and 'META-INF/com/google/android/update-binary' in names
+            assert {n[:-4] for n in names if n.endswith('.img') and '/' not in n}==set(PARTS),'Unexpected image set'
+            assert hashlib.sha256(src.read('vbmeta.img')).hexdigest()==STOCK_VB,'Wrong stock AVB input'
+            for part in PARTS:
+                if part=='vbmeta': size=len(raw); h=EXPECTED[part]
+                else:
+                    info=src.getinfo(part+'.img');size=info.file_size
+                    with src.open(info) as f: assert f.read(4)!=bytes.fromhex('3aff26ed'),'Sparse image unsupported: '+part
+                    with src.open(info) as f:h=digest(f)
+                    if part in EXPECTED:assert h==EXPECTED[part] and size==provenance['records'][part]['size'],f'Stock AP image mismatch: {part}, actual={h}, expected={EXPECTED[part]}'
+                assert size>0
+                records[part]={'size':size,'sha256':h}
+                patch=patch.replace('@SIZE_'+part+'@',str(size)).replace('@HASH_'+part+'@',h)
+            assert records['super']['size']<=8287944704
+            assert '@SIZE_' not in patch and '@HASH_' not in patch
+            subprocess.run(['bash','-n'],input=patch,text=True,check=True)
+            (R/'r20-installer.sh').write_text(patch)
+            assert shutil.disk_usage(work).free>sum(x['size'] for x in records.values())+512*1024**2,'Insufficient disk for packaging'
+            # Create fresh ZIP headers. Do not carry old extra fields (duplicate ZIP64 bug).
+            def clean_info(i):
+                j=zipfile.ZipInfo(i.filename,date_time=i.date_time);j.compress_type=zipfile.ZIP_DEFLATED;j.external_attr=i.external_attr;j.create_system=i.create_system
+                return j
+            with zipfile.ZipFile(TARGET,'x',compression=zipfile.ZIP_DEFLATED,compresslevel=1,allowZip64=True) as dst:
+                for info in src.infolist():
+                    n=info.filename
+                    if n in (SCRIPT,'vbmeta.img'):continue
+                    # Copy only installer assets and the intended images; old signature is invalid.
+                    if not (n.startswith('META-INF/zbin/') or n.startswith('META-INF/addons/') or n=='META-INF/com/google/android/update-binary' or n in {p+'.img' for p in PARTS}):continue
+                    j=clean_info(info)
+                    if info.is_dir():dst.writestr(j,b'');continue
+                    with src.open(info) as f,dst.open(j,'w',force_zip64=info.file_size>=2**31) as g:shutil.copyfileobj(f,g,8*1024*1024)
+                dst.writestr('vbmeta.img',raw)
+                dst.writestr(SCRIPT,patch)
+                dst.writestr('README_EXPERIMENTAL.txt','SM-M146B SFDZI1 only. A16 donor boot-isolation test; R15/R17 changes omitted. Bootloader must be unlocked. AVB and dm-verity disabled (flags 3). Unsigned experimental recovery package. Back up data and keep stock Odin firmware available. Do not relock bootloader. No OTA. No device testing or banking compatibility guarantee. SSRM/NFC/BT and runtime thermal behavior not established.\n')
+                dst.write(root/'LICENSE','UPSTREAM-LICENSE.txt')
+            # Read all entries and verify CRC plus exact intended bytes.
+        with zipfile.ZipFile(TARGET) as z:
+            assert len(z.namelist())==len(set(z.namelist()))
+            assert z.testzip() is None
+            assert z.read(SCRIPT).decode()==patch
+            assert hashlib.sha256(z.read('META-INF/zbin/core')).hexdigest()==CORE
+            for p,r in records.items():
+                assert z.getinfo(p+'.img').file_size==r['size']
+                with z.open(p+'.img') as f:assert digest(f)==r['sha256'],p
+            assert z.read('vbmeta.img')==raw
+        # Independent 7z compatibility test when available (required before delivery).
+        seven=shutil.which('7z') or shutil.which('7zz')
+        assert seven,'7z is required for installer archive compatibility test'
+        with (R/'r20-7z-test.txt').open('w') as out:subprocess.run([seven,'t',str(TARGET)],stdout=out,stderr=subprocess.STDOUT,check=True,timeout=1800)
+        report={'status':'EXPERIMENTAL_AVB3_NOT_DEVICE_TESTED','file':TARGET.name,'size':TARGET.stat().st_size,'sha256':fsha(TARGET),'images':records,'flags':3,'vbmeta_matches_FIX2':True,'stock_boot_chain_exact_match':True,'stock_chain_source':provenance,'donor':'SM-A166B/A166BXXUAEZJ5','r15_r17_applied':False,'vintf_runtime_validated':False,'installer_core_exact_match':True,'zip_crc':'PASS','7z_test':'PASS','ota_allowed':False,'boot_validated':False,'ssrm_fixed':False,'rootlessness_validated':False,'banking_validated':False}
+        (work/'LUNA_OS_A17_Build_Result.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
+        PY_PACKAGE
+    - name: Keep OTA disabled for experimental build
+      if: inputs.mode == 'build'
+      run: |
+        python3 - <<'PY_OTA'
+        import json
+        from pathlib import Path
+        p=Path('/tmp/luna-r17-reports/ota-candidate.json');p.write_text(json.dumps({'project':'LUNA OS','version':'9.0 R21_A16 AVB3 TEST','device':'SM-M146B','base_firmware':'M146BXXSFDZI1','install_allowed':False,'automatic_install':False,'release_status':'experimental_manual_recovery_only','blockers':['device boot untested','SSRM runtime unresolved','AVB verification disabled','banking and rootlessness unvalidated']},indent=2))
+        PY_OTA
+    - name: Deliver experimental test package to GoFile
+      if: inputs.mode == 'build' && inputs.delivery == 'gofile'
+      env:
+        GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+        GOFILE_FOLDER_ID: ${{ secrets.GOFILE_FOLDER_ID }}
+      run: |
+        bash "$RUNNER_TEMP/lumacore-gofile-upload.sh" LUNA_OS_9_R21_A16_BOOT_TEST.zip upload-status.txt
+    - name: Collect diagnostic reports
+      if: always()
+      run: |
+        cp /tmp/lunaos-r15-state/integration.json r15-integration.json 2>/dev/null || true
+        cp /tmp/lunaos-r15-state/display-thermal-references.zip r15-display-thermal-references.zip 2>/dev/null || true
+        cp /tmp/lunaos-sdk37-state/before.json sdk37-before.json 2>/dev/null || true
+        cp /tmp/lunaos-sdk37-state/after.json sdk37-after.json 2>/dev/null || true
+        find /tmp/ReCoreUI/out -maxdepth 2 -type f -printf '%P\t%s bytes\n' 2>/dev/null > output-files.txt || true
+        mkdir -p r17-reports
+        cp -a /tmp/luna-r17-reports/. r17-reports/ 2>/dev/null || true
+    - name: Upload small build report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: LUNA-OS-R21_A16-AVB3-build-result
+        path: |
+          status.txt
+          upstream-commit.txt
+          upstream-LICENSE.txt
+          patch-stat.txt
+          alpha2-source-cleanup.json
+          build.log
+          r15-integration.json
+          r15-display-thermal-references.zip
+          sdk37-before.json
+          sdk37-after.json
+          output-files.txt
+          upload-status.txt
+          LUNA_OS_A17_Build_Result.json
+          r17-reports/
+        if-no-files-found: warn
+        retention-days: 7
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'build: A16 donor boot-isolation candidate; preflight: tools only'
+        type: choice
+        required: true
+        default: build
+        options:
+        - preflight
+        - build
+      delivery:
+        description: 'GoFile: experimental unsigned recovery test package only; GitHub receives reports'
+        required: true
+        type: choice
+        default: gofile
+        options:
+        - gofile
+        - report_only
